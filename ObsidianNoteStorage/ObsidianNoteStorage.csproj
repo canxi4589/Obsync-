@@ -5,6 +5,18 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+	  <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+		<GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+		<PackageId>Obsync</PackageId>
+		<Product>obsync</Product>
+	  <AssemblyName>obsync</AssemblyName>
+	  <RootNamespace>ObsidianSync</RootNamespace>
+
   </PropertyGroup>
+
+  <ItemGroup>
+	  <PackageReference Include="System.CommandLine" Version="2.0.7" />
+	  <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.7" />
+  </ItemGroup>
 
 </Project>

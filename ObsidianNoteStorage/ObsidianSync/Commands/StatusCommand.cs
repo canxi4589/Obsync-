@@ -9,7 +9,7 @@ public static class StatusCommand
     {
         var cmd = new Command("status", "Show vault status and encrypted note inventory.");
 
-        cmd.SetHandler(() =>
+        cmd.SetAction((ParseResult _) =>
         {
             var config = ConfigService.Load();
             var hasPassword = EncryptionService.HasPassword();

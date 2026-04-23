@@ -9,7 +9,7 @@ public static class InitCommand
     {
         var cmd = new Command("init", "Set or update the master encryption password.");
 
-        cmd.SetHandler(() =>
+        cmd.SetAction((ParseResult _) =>
         {
             Console.Write("Enter new master password: ");
             var password = ReadPassword();
@@ -20,11 +20,18 @@ public static class InitCommand
             if (password != confirm)
             {
                 Console.Error.WriteLine("Passwords do not match.");
-                return;
+                return 1;
             }
 
             EncryptionService.SetPassword(password);
+
+            // Ensure config.json exists on disk so subsequent commands can load it.
+            var config = ConfigService.Load();
+            ConfigService.Save(config);
+
             Console.WriteLine("Password saved (protected by Windows DPAPI).");
+            Console.WriteLine($"Config written to: {ConfigService.ConfigPath}");
+            return 0;
         });
 
         return cmd;
@@ -39,11 +46,16 @@ public static class InitCommand
             if (k.Key == ConsoleKey.Enter) break;
             if (k.Key == ConsoleKey.Backspace)
             {
-                if (sb.Length > 0) sb.Length--;
+                if (sb.Length > 0)
+                {
+                    sb.Length--;
+                    Console.Write("\b \b");
+                }
             }
             else
             {
                 sb.Append(k.KeyChar);
+                Console.Write('*');
             }
         }
         Console.WriteLine();

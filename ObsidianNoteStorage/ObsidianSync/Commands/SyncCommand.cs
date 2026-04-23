@@ -8,21 +8,23 @@ public static class SyncCommand
 {
     public static Command Build()
     {
-        var vaultOpt = new Option<string?>("--vault", "Vault name to sync (omit to sync all).");
-        var forceOpt = new Option<bool>("--force", "Commit even if no changes detected.");
+        var vaultOpt = new Option<string?>("--vault") { Description = "Vault name to sync (omit to sync all)." };
+        var forceOpt = new Option<bool>("--force") { Description = "Commit even if no changes detected." };
 
-        var cmd = new Command("sync", "Encrypt private notes and push all vaults to GitHub.")
-        {
-            vaultOpt, forceOpt
-        };
+        var cmd = new Command("sync", "Encrypt private notes and push all vaults to GitHub.");
+        cmd.Options.Add(vaultOpt);
+        cmd.Options.Add(forceOpt);
 
-        cmd.SetHandler((vaultName, force) =>
+        cmd.SetAction((ParseResult r) =>
         {
+            var vaultName = r.GetValue(vaultOpt);
+            var force = r.GetValue(forceOpt);
+
             var password = EncryptionService.GetPassword();
             if (password is null)
             {
                 Console.Error.WriteLine("No password set. Run: obsync init");
-                return;
+                return 1;
             }
 
             var config = ConfigService.Load();
@@ -37,13 +39,14 @@ public static class SyncCommand
                 Console.Error.WriteLine(vaultName is null
                     ? "No vaults configured. Run: obsync vault add"
                     : $"Vault '{vaultName}' not found.");
-                return;
+                return 1;
             }
 
             foreach (var vault in vaults)
                 SyncVault(vault, password, force);
 
-        }, vaultOpt, forceOpt);
+            return 0;
+        });
 
         return cmd;
     }

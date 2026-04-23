@@ -10,49 +10,63 @@ public static class VaultCommand
     {
         var cmd = new Command("vault", "Manage vault references.");
 
-        cmd.AddCommand(BuildAdd());
-        cmd.AddCommand(BuildList());
-        cmd.AddCommand(BuildRemove());
+        cmd.Subcommands.Add(BuildAdd());
+        cmd.Subcommands.Add(BuildList());
+        cmd.Subcommands.Add(BuildRemove());
 
         return cmd;
     }
 
     private static Command BuildAdd()
     {
-        var nameArg = new Argument<string>("name", "Friendly name for the vault.");
-        var pathArg = new Argument<string>("path", "Absolute path to the vault directory.");
-        var remoteOpt = new Option<string?>("--remote", "Override git remote URL (optional).");
-        var folderOpt = new Option<string>("--private-folder", () => "private", "Subfolder for sensitive notes.");
-
-        var add = new Command("add", "Add a vault to the config.") { nameArg, pathArg, remoteOpt, folderOpt };
-
-        add.SetHandler((name, path, remote, folder) =>
+        var nameArg = new Argument<string>("name") { Description = "Friendly name for the vault." };
+        var pathArg = new Argument<string>("path") { Description = "Absolute path to the vault directory." };
+        var remoteOpt = new Option<string?>("--remote") { Description = "Override git remote URL (optional)." };
+        var folderOpt = new Option<string?>("--private-folder")
         {
-            path = Path.GetFullPath(path);
+            Description = "Subfolder for sensitive notes.",
+            DefaultValueFactory = _ => "private"
+        };
+
+        var add = new Command("add", "Add a vault to the config.");
+        add.Arguments.Add(nameArg);
+        add.Arguments.Add(pathArg);
+        add.Options.Add(remoteOpt);
+        add.Options.Add(folderOpt);
+
+        add.SetAction((ParseResult r) =>
+        {
+            var name = r.GetValue(nameArg);
+            var path = r.GetValue(pathArg);
+            var remote = r.GetValue(remoteOpt);
+            var folder = r.GetValue(folderOpt);
+
+            path = Path.GetFullPath(path!);
             if (!Directory.Exists(path))
             {
                 Console.Error.WriteLine($"Path does not exist: {path}");
-                return;
+                return 1;
             }
 
             var config = ConfigService.Load();
             if (config.Vaults.Any(v => v.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
             {
                 Console.Error.WriteLine($"Vault '{name}' already exists. Remove it first.");
-                return;
+                return 1;
             }
 
             config.Vaults.Add(new VaultConfig
             {
-                Name = name,
+                Name = name!,
                 Path = path,
                 RemoteUrl = remote,
-                PrivateFolder = folder
+                PrivateFolder = folder ?? "private"
             });
 
             ConfigService.Save(config);
             Console.WriteLine($"Added vault '{name}' → {path}");
-        }, nameArg, pathArg, remoteOpt, folderOpt);
+            return 0;
+        });
 
         return add;
     }
@@ -61,7 +75,7 @@ public static class VaultCommand
     {
         var list = new Command("list", "List configured vaults.");
 
-        list.SetHandler(() =>
+        list.SetAction((ParseResult _) =>
         {
             var config = ConfigService.Load();
             if (config.Vaults.Count == 0)
@@ -85,11 +99,13 @@ public static class VaultCommand
 
     private static Command BuildRemove()
     {
-        var nameArg = new Argument<string>("name", "Name of the vault to remove.");
-        var remove = new Command("remove", "Remove a vault from config.") { nameArg };
+        var nameArg = new Argument<string>("name") { Description = "Name of the vault to remove." };
+        var remove = new Command("remove", "Remove a vault from config.");
+        remove.Arguments.Add(nameArg);
 
-        remove.SetHandler((name) =>
+        remove.SetAction((ParseResult r) =>
         {
+            var name = r.GetValue(nameArg);
             var config = ConfigService.Load();
             var removed = config.Vaults.RemoveAll(v =>
                 v.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
@@ -97,12 +113,13 @@ public static class VaultCommand
             if (removed == 0)
             {
                 Console.Error.WriteLine($"Vault '{name}' not found.");
-                return;
+                return 1;
             }
 
             ConfigService.Save(config);
             Console.WriteLine($"Removed vault '{name}'.");
-        }, nameArg);
+            return 0;
+        });
 
         return remove;
     }

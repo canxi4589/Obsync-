@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -8,6 +9,7 @@ namespace ObsidianSync.Services;
 /// Password itself stored via Windows DPAPI — no plaintext on disk.
 /// File format: [salt 16B][nonce 12B][tag 16B][ciphertext]
 /// </summary>
+[SupportedOSPlatform("windows")]
 public static class EncryptionService
 {
     private const int SaltSize = 16;
