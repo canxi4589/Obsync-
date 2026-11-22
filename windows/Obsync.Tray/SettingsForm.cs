@@ -1,16 +1,20 @@
 using System.Drawing;
 using Obsync.Core.Models;
+using Obsync.Core.Services;
 
 namespace Obsync.Tray;
 
 internal sealed class SettingsForm : Form
 {
+    private const int MaxVisibleLogLines = 200;
+
     private readonly TrayApplicationContext _ctx;
     private readonly ListView _vaultList;
     private readonly NumericUpDown _intervalBox;
     private readonly CheckBox _watchBox;
     private readonly CheckBox _startupBox;
     private readonly TextBox _logBox;
+    private readonly Font _logFont;
 
     public SettingsForm(TrayApplicationContext ctx)
     {
@@ -120,6 +124,7 @@ internal sealed class SettingsForm : Form
 
         // ── Tab 3: Activity Log ─────────────────────────────────────────────
         var logPage = new TabPage("Activity Log");
+        _logFont = new Font("Consolas", 9.5f);
         _logBox = new TextBox
         {
             Dock = DockStyle.Fill,
@@ -127,7 +132,8 @@ internal sealed class SettingsForm : Form
             ReadOnly = true,
             ScrollBars = ScrollBars.Both,
             WordWrap = false,
-            Font = new Font("Consolas", 9.5f),
+            MaxLength = 0,
+            Font = _logFont,
             BackColor = Color.FromArgb(15, 23, 42),
             ForeColor = Color.FromArgb(226, 232, 240)
         };
@@ -165,7 +171,14 @@ internal sealed class SettingsForm : Form
         if (IsDisposed || !IsHandleCreated) return;
         BeginInvoke(() =>
         {
+            if (IsDisposed) return;
             _logBox.AppendText(line + Environment.NewLine);
+            if (_logBox.Lines.Length > MaxVisibleLogLines + 20)
+            {
+                _logBox.Lines = _ctx.GetLogsSnapshot().ToArray();
+                _logBox.SelectionStart = _logBox.TextLength;
+                _logBox.ScrollToCaret();
+            }
         });
     }
 
@@ -177,16 +190,27 @@ internal sealed class SettingsForm : Form
 
     private void RefreshVaultList()
     {
-        _vaultList.Items.Clear();
-        foreach (var v in _ctx.CurrentConfig.Vaults)
+        _vaultList.BeginUpdate();
+        try
         {
-            var item = new ListViewItem(v.Name);
-            item.SubItems.Add(v.Path);
-            item.SubItems.Add(string.IsNullOrWhiteSpace(v.RemoteUrl) ? "(existing)" : v.RemoteUrl);
-            item.SubItems.Add(v.Enabled ? "Yes" : "No");
-            item.SubItems.Add(v.LastStatus ?? "Never synced");
-            item.Tag = v;
-            _vaultList.Items.Add(item);
+            _vaultList.Items.Clear();
+            foreach (var v in _ctx.CurrentConfig.Vaults)
+            {
+                var item = new ListViewItem(v.Name);
+                item.SubItems.Add(v.Path);
+                item.SubItems.Add(
+                    string.IsNullOrWhiteSpace(v.RemoteUrl)
+                        ? "(existing)"
+                        : GitSyncService.RedactCredentials(v.RemoteUrl));
+                item.SubItems.Add(v.Enabled ? "Yes" : "No");
+                item.SubItems.Add(v.LastStatus ?? "Never synced");
+                item.Tag = v;
+                _vaultList.Items.Add(item);
+            }
+        }
+        finally
+        {
+            _vaultList.EndUpdate();
         }
     }
 
@@ -267,6 +291,7 @@ internal sealed class SettingsForm : Form
         {
             _ctx.LogAppended -= OnLogAppended;
             _ctx.ConfigOrStatusUpdated -= OnConfigOrStatusUpdated;
+            _logFont.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -327,7 +352,7 @@ internal sealed class SettingsForm : Form
             _remoteBox = new TextBox
             {
                 Text = Vault.RemoteUrl ?? string.Empty,
-                PlaceholderText = "Optional — leave blank to use existing git origin",
+                PlaceholderText = "Optional https:// or git@host:repo (avoid embedding tokens)",
                 Dock = DockStyle.Fill
             };
             _commitBox = new TextBox { Text = Vault.CommitMessage, Dock = DockStyle.Fill };
@@ -361,9 +386,17 @@ internal sealed class SettingsForm : Form
                     MessageBox.Show("Enter a vault name and an existing folder path.", "Validation", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
+
+                var remoteCandidate = string.IsNullOrWhiteSpace(_remoteBox.Text) ? null : _remoteBox.Text.Trim();
+                if (!GitSyncService.TryValidateRemoteUrl(remoteCandidate, out var remoteError))
+                {
+                    MessageBox.Show(remoteError, "Invalid Remote URL", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
                 Vault.Name = _nameBox.Text.Trim();
                 Vault.Path = Path.GetFullPath(_pathBox.Text.Trim());
-                Vault.RemoteUrl = string.IsNullOrWhiteSpace(_remoteBox.Text) ? null : _remoteBox.Text.Trim();
+                Vault.RemoteUrl = remoteCandidate;
                 Vault.CommitMessage = string.IsNullOrWhiteSpace(_commitBox.Text) ? "sync: {timestamp}" : _commitBox.Text.Trim();
                 Vault.Enabled = _enabledBox.Checked;
                 DialogResult = DialogResult.OK;

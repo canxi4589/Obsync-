@@ -83,4 +83,17 @@ public sealed class TrayConfigServiceTests : IDisposable
         Assert.Equal("C:/Docs/MyVault", loaded.Vaults[0].Path);
         Assert.True(File.Exists(cfgPath));
     }
+
+    [Fact]
+    public void Load_RecoversGracefullyFromCorruptedConfigFile()
+    {
+        var cfgPath = Path.Combine(_tempDir, "tray-config.json");
+        File.WriteAllText(cfgPath, "{ truncated corrupted json !!!");
+
+        var service = new TrayConfigService(cfgPath, Path.Combine(_tempDir, "missing.json"));
+        var loaded = service.Load();
+
+        Assert.Empty(loaded.Vaults);
+        Assert.True(File.Exists(cfgPath + ".corrupt"));
+    }
 }

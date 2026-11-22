@@ -1,11 +1,30 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using Obsync.Core.Models;
 
 namespace Obsync.Core.Services;
 
-public sealed class GitSyncService
+public sealed partial class GitSyncService
 {
     private readonly string _gitExe;
+    private readonly ConcurrentDictionary<string, DateTime> _checkedGitIgnoreCache = new(StringComparer.OrdinalIgnoreCase);
+
+    [GeneratedRegex(@"://[^/\s@]+@", RegexOptions.Compiled)]
+    private static partial Regex UrlCredentialsRegex();
+
+    [GeneratedRegex(@"^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.+$", RegexOptions.Compiled)]
+    private static partial Regex ScpRemoteRegex();
+
+    private static readonly string[] SecretExcludePathspecs =
+    [
+        ":(exclude)obsync-recovery-key*.txt",
+        ":(exclude)**/obsync-recovery-key*.txt",
+        ":(exclude).env",
+        ":(exclude)**/.env",
+        ":(exclude).env.*",
+        ":(exclude)**/.env.*"
+    ];
 
     public GitSyncService(string? gitExecutable = null)
     {
@@ -21,6 +40,67 @@ public sealed class GitSyncService
         return "git";
     }
 
+    /// <summary>
+    /// Validates a user-configured Git remote URL to prevent Git argument injection
+    /// and dangerous transport protocols (e.g. ext::, file://).
+    /// </summary>
+    public static bool TryValidateRemoteUrl(string? remoteUrl, out string error)
+    {
+        if (string.IsNullOrWhiteSpace(remoteUrl))
+        {
+            error = string.Empty;
+            return true;
+        }
+
+        var trimmed = remoteUrl.Trim();
+        if (trimmed.StartsWith('-'))
+        {
+            error = "Remote URL cannot start with '-'.";
+            return false;
+        }
+        if (trimmed.Any(c => char.IsControl(c) || char.IsWhiteSpace(c)))
+        {
+            error = "Remote URL cannot contain whitespace or control characters.";
+            return false;
+        }
+
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+        {
+            if (uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ||
+                uri.Scheme.Equals("ssh", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(uri.Host))
+                {
+                    error = "Remote URL must include a valid hostname.";
+                    return false;
+                }
+                error = string.Empty;
+                return true;
+            }
+
+            error = $"Unsupported remote URL scheme '{uri.Scheme}'. Use https:// or ssh:// (or git@host:path).";
+            return false;
+        }
+
+        if (ScpRemoteRegex().IsMatch(trimmed))
+        {
+            error = string.Empty;
+            return true;
+        }
+
+        error = "Remote URL must be a valid https://, ssh://, or git@host:repo URL.";
+        return false;
+    }
+
+    /// <summary>
+    /// Masks embedded user:token@ credentials in URLs before displaying or logging.
+    /// </summary>
+    public static string RedactCredentials(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        return UrlCredentialsRegex().Replace(text, "://***@");
+    }
+
     public async Task<SyncResult> SyncVaultAsync(VaultEntry vault, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(vault.Path) || !Directory.Exists(vault.Path))
@@ -34,17 +114,38 @@ public sealed class GitSyncService
                 ErrorDetails: vault.Path);
         }
 
-        var insideCheck = await RunGitAsync(vault.Path, ct, "rev-parse", "--is-inside-work-tree");
-        if (insideCheck.ExitCode != 0)
+        if (!string.IsNullOrWhiteSpace(vault.RemoteUrl))
         {
+            if (!TryValidateRemoteUrl(vault.RemoteUrl, out var urlError))
+            {
+                return new SyncResult(
+                    vault.Name,
+                    Success: false,
+                    HadChanges: false,
+                    HadConflict: false,
+                    Summary: "Invalid git remote URL.",
+                    ErrorDetails: urlError);
+            }
+        }
+
+        await EnsureEncryptedVaultNotIgnoredAsync(vault.Path, ct);
+
+        // Single git call returns repo validity, branch, HEAD OID, upstream, ahead/behind, and working tree status
+        var statusRes = await RunGitAsync(vault.Path, ct, "status", "--porcelain=v2", "--branch");
+        if (statusRes.ExitCode != 0)
+        {
+            var err = RedactCredentials(CombineOutput(statusRes));
+            var notRepo = err.Contains("not a git repository", StringComparison.OrdinalIgnoreCase);
             return new SyncResult(
                 vault.Name,
                 Success: false,
                 HadChanges: false,
                 HadConflict: false,
-                Summary: "Folder is not a git repository.",
-                ErrorDetails: CombineOutput(insideCheck));
+                Summary: notRepo ? "Folder is not a git repository." : "git status failed.",
+                ErrorDetails: err);
         }
+
+        var parsedStatus = ParseStatusV2(statusRes.StdOut);
 
         if (!string.IsNullOrWhiteSpace(vault.RemoteUrl))
         {
@@ -57,28 +158,24 @@ public sealed class GitSyncService
                     HadChanges: false,
                     HadConflict: false,
                     Summary: "Failed to configure git remote 'origin'.",
-                    ErrorDetails: CombineOutput(remoteResult));
+                    ErrorDetails: RedactCredentials(CombineOutput(remoteResult)));
             }
         }
 
-        await EnsureEncryptedVaultNotIgnoredAsync(vault.Path, ct);
-
         bool committedLocal = false;
-        var status = await RunGitAsync(vault.Path, ct, "status", "--porcelain");
-        if (status.ExitCode != 0)
-        {
-            return new SyncResult(
-                vault.Name,
-                Success: false,
-                HadChanges: false,
-                HadConflict: false,
-                Summary: "git status failed.",
-                ErrorDetails: CombineOutput(status));
-        }
+        string headBeforePull = parsedStatus.HeadOid;
+        bool hasCommits = parsedStatus.HasCommits;
+        int aheadCount = parsedStatus.AheadCount;
 
-        if (!string.IsNullOrWhiteSpace(status.StdOut))
+        if (parsedStatus.HasDirtyFiles)
         {
-            var add = await RunGitAsync(vault.Path, ct, "add", "-A");
+            var addArgs = new List<string>(2 + 2 + SecretExcludePathspecs.Length)
+            {
+                "add", "-A", "--", "."
+            };
+            addArgs.AddRange(SecretExcludePathspecs);
+
+            var add = await RunGitAsync(vault.Path, ct, [.. addArgs]);
             if (add.ExitCode != 0)
             {
                 return new SyncResult(
@@ -87,11 +184,12 @@ public sealed class GitSyncService
                     HadChanges: false,
                     HadConflict: false,
                     Summary: "git add failed.",
-                    ErrorDetails: CombineOutput(add));
+                    ErrorDetails: RedactCredentials(CombineOutput(add)));
             }
 
-            var staged = await RunGitAsync(vault.Path, ct, "diff", "--cached", "--name-only");
-            if (!string.IsNullOrWhiteSpace(staged.StdOut))
+            // Exit code 1 means there are staged changes; 0 means nothing staged
+            var stagedCheck = await RunGitAsync(vault.Path, ct, "diff", "--cached", "--quiet");
+            if (stagedCheck.ExitCode == 1)
             {
                 var template = string.IsNullOrWhiteSpace(vault.CommitMessage)
                     ? "sync: {timestamp}"
@@ -107,47 +205,69 @@ public sealed class GitSyncService
                         HadChanges: false,
                         HadConflict: false,
                         Summary: "git commit failed.",
-                        ErrorDetails: CombineOutput(commit));
+                        ErrorDetails: RedactCredentials(CombineOutput(commit)));
                 }
                 committedLocal = true;
+                hasCommits = true;
+                aheadCount++;
             }
         }
 
-        var remotes = await RunGitAsync(vault.Path, ct, "remote");
-        if (string.IsNullOrWhiteSpace(remotes.StdOut))
+        var branch = !string.IsNullOrWhiteSpace(parsedStatus.BranchHead) &&
+                     !parsedStatus.BranchHead.Equals("(detached)", StringComparison.Ordinal)
+            ? parsedStatus.BranchHead
+            : "main";
+        if (branch.StartsWith('-'))
         {
             return new SyncResult(
                 vault.Name,
-                Success: true,
+                Success: false,
                 HadChanges: committedLocal,
                 HadConflict: false,
-                Summary: committedLocal
-                    ? "Committed locally (no git remote configured)."
-                    : "Local repository clean (no remote).");
+                Summary: "Invalid git branch name.",
+                ErrorDetails: $"Refusing to sync branch starting with '-': {branch}");
         }
 
-        var branchRes = await RunGitAsync(vault.Path, ct, "rev-parse", "--abbrev-ref", "HEAD");
-        var branch = branchRes.ExitCode == 0 && !string.IsNullOrWhiteSpace(branchRes.StdOut)
-            ? branchRes.StdOut.Trim()
-            : "main";
-        var remoteName = SelectRemoteName(remotes.StdOut);
+        bool hasUpstream = !string.IsNullOrWhiteSpace(parsedStatus.Upstream);
+        string remoteName;
 
-        var headBeforePull = (await RunGitAsync(vault.Path, ct, "rev-parse", "--verify", "HEAD")).StdOut.Trim();
+        if (hasUpstream)
+        {
+            var slash = parsedStatus.Upstream!.IndexOf('/');
+            remoteName = slash > 0 ? parsedStatus.Upstream[..slash] : "origin";
+        }
+        else
+        {
+            var remotes = await RunGitAsync(vault.Path, ct, "remote");
+            if (string.IsNullOrWhiteSpace(remotes.StdOut))
+            {
+                return new SyncResult(
+                    vault.Name,
+                    Success: true,
+                    HadChanges: committedLocal,
+                    HadConflict: false,
+                    Summary: committedLocal
+                        ? "Committed locally (no git remote configured)."
+                        : "Local repository clean (no remote).");
+            }
+            remoteName = SelectRemoteName(remotes.StdOut);
+        }
 
-        // Pull with rebase if remote branch exists
-        var upstreamCheck = await RunGitAsync(
-            vault.Path,
-            ct,
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{u}");
-        bool hasUpstream = upstreamCheck.ExitCode == 0;
+        if (remoteName.StartsWith('-'))
+        {
+            return new SyncResult(
+                vault.Name,
+                Success: false,
+                HadChanges: committedLocal,
+                HadConflict: false,
+                Summary: "Invalid git remote name.",
+                ErrorDetails: $"Refusing to use remote starting with '-': {remoteName}");
+        }
 
         bool remoteBranchExists = hasUpstream;
         if (!remoteBranchExists)
         {
-            var lsRemote = await RunGitAsync(vault.Path, ct, "ls-remote", "--heads", remoteName, branch);
+            var lsRemote = await RunGitAsync(vault.Path, ct, "ls-remote", "--heads", "--", remoteName, branch);
             if (lsRemote.ExitCode != 0)
             {
                 return new SyncResult(
@@ -156,9 +276,15 @@ public sealed class GitSyncService
                     HadChanges: committedLocal,
                     HadConflict: false,
                     Summary: "Cannot reach remote repository.",
-                    ErrorDetails: CombineOutput(lsRemote));
+                    ErrorDetails: RedactCredentials(CombineOutput(lsRemote)));
             }
             remoteBranchExists = !string.IsNullOrWhiteSpace(lsRemote.StdOut);
+        }
+
+        // Capture exact post-commit HEAD OID only when we created a new local commit
+        if (committedLocal && remoteBranchExists)
+        {
+            headBeforePull = (await RunGitAsync(vault.Path, ct, "rev-parse", "--verify", "HEAD")).StdOut.Trim();
         }
 
         bool pulledRemote = false;
@@ -166,11 +292,11 @@ public sealed class GitSyncService
         {
             var pull = hasUpstream
                 ? await RunGitAsync(vault.Path, ct, "pull", "--rebase", "--autostash")
-                : await RunGitAsync(vault.Path, ct, "pull", "--rebase", "--autostash", remoteName, branch);
+                : await RunGitAsync(vault.Path, ct, "pull", "--rebase", "--autostash", "--", remoteName, branch);
 
             if (pull.ExitCode != 0)
             {
-                var combined = CombineOutput(pull);
+                var combined = RedactCredentials(CombineOutput(pull));
                 bool rebaseActive = await IsRebaseInProgressAsync(vault.Path, ct);
                 bool isConflict =
                     rebaseActive ||
@@ -193,13 +319,16 @@ public sealed class GitSyncService
                     ErrorDetails: combined);
             }
 
-            var headAfterPull = (await RunGitAsync(vault.Path, ct, "rev-parse", "--verify", "HEAD")).StdOut.Trim();
-            pulledRemote = !string.Equals(headBeforePull, headAfterPull, StringComparison.Ordinal);
+            var headAfterRes = await RunGitAsync(vault.Path, ct, "rev-parse", "--verify", "HEAD");
+            if (headAfterRes.ExitCode == 0)
+            {
+                hasCommits = true;
+                var headAfterPull = headAfterRes.StdOut.Trim();
+                pulledRemote = !string.Equals(headBeforePull, headAfterPull, StringComparison.Ordinal);
+            }
         }
 
-        // Push if HEAD exists and either no upstream is set yet or local branch is ahead
-        var headCheck = await RunGitAsync(vault.Path, ct, "rev-parse", "--verify", "HEAD");
-        if (headCheck.ExitCode != 0)
+        if (!hasCommits)
         {
             return new SyncResult(
                 vault.Name,
@@ -209,20 +338,14 @@ public sealed class GitSyncService
                 Summary: "Repository initialized (no commits yet).");
         }
 
-        bool shouldPush = !hasUpstream;
-        if (!shouldPush)
-        {
-            var aheadCheck = await RunGitAsync(vault.Path, ct, "rev-list", "--count", "@{u}..HEAD");
-            shouldPush = aheadCheck.ExitCode != 0 ||
-                         (int.TryParse(aheadCheck.StdOut.Trim(), out int aheadCount) && aheadCount > 0);
-        }
-
+        bool shouldPush = !hasUpstream || committedLocal || aheadCount > 0;
         bool pushedLocal = false;
+
         if (shouldPush)
         {
             var push = hasUpstream
                 ? await RunGitAsync(vault.Path, ct, "push")
-                : await RunGitAsync(vault.Path, ct, "push", "-u", remoteName, branch);
+                : await RunGitAsync(vault.Path, ct, "push", "-u", "--", remoteName, branch);
 
             if (push.ExitCode != 0)
             {
@@ -232,7 +355,7 @@ public sealed class GitSyncService
                     HadChanges: committedLocal || pulledRemote,
                     HadConflict: false,
                     Summary: "git push failed.",
-                    ErrorDetails: CombineOutput(push));
+                    ErrorDetails: RedactCredentials(CombineOutput(push)));
             }
             pushedLocal = committedLocal || !hasUpstream || !push.StdErr.Contains("Everything up-to-date", StringComparison.OrdinalIgnoreCase);
         }
@@ -259,6 +382,62 @@ public sealed class GitSyncService
             Summary: summary);
     }
 
+    internal readonly record struct StatusV2Info(
+        string HeadOid,
+        bool HasCommits,
+        string BranchHead,
+        string? Upstream,
+        int AheadCount,
+        int BehindCount,
+        bool HasDirtyFiles);
+
+    internal static StatusV2Info ParseStatusV2(string stdOut)
+    {
+        string headOid = string.Empty;
+        bool hasCommits = false;
+        string branchHead = string.Empty;
+        string? upstream = null;
+        int ahead = 0;
+        int behind = 0;
+        bool hasDirty = false;
+
+        foreach (var rawLine in stdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (rawLine.StartsWith("# branch.oid ", StringComparison.Ordinal))
+            {
+                var oid = rawLine["# branch.oid ".Length..].Trim();
+                if (!oid.Equals("(initial)", StringComparison.Ordinal))
+                {
+                    headOid = oid;
+                    hasCommits = true;
+                }
+            }
+            else if (rawLine.StartsWith("# branch.head ", StringComparison.Ordinal))
+            {
+                branchHead = rawLine["# branch.head ".Length..].Trim();
+            }
+            else if (rawLine.StartsWith("# branch.upstream ", StringComparison.Ordinal))
+            {
+                upstream = rawLine["# branch.upstream ".Length..].Trim();
+            }
+            else if (rawLine.StartsWith("# branch.ab ", StringComparison.Ordinal))
+            {
+                var parts = rawLine["# branch.ab ".Length..].Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var p in parts)
+                {
+                    if (p.StartsWith('+') && int.TryParse(p[1..], out int a)) ahead = a;
+                    else if (p.StartsWith('-') && int.TryParse(p[1..], out int b)) behind = b;
+                }
+            }
+            else if (!rawLine.StartsWith('#'))
+            {
+                hasDirty = true;
+            }
+        }
+
+        return new StatusV2Info(headOid, hasCommits, branchHead, upstream, ahead, behind, hasDirty);
+    }
+
     private async Task<GitCommandResult> EnsureRemoteUrlAsync(string workingDir, string remoteUrl, CancellationToken ct)
     {
         var current = await RunGitAsync(workingDir, ct, "remote", "get-url", "origin");
@@ -278,10 +457,24 @@ public sealed class GitSyncService
         var vaultDir = Path.Combine(workingDir, ".obsync-vault");
         if (!Directory.Exists(vaultDir)) return;
 
-        var check = await RunGitAsync(workingDir, ct, "check-ignore", "-q", ".obsync-vault/vault.json");
-        if (check.ExitCode != 0) return;
-
         var gitignorePath = Path.Combine(workingDir, ".gitignore");
+        var gitignoreMtime = File.Exists(gitignorePath)
+            ? File.GetLastWriteTimeUtc(gitignorePath)
+            : DateTime.MinValue;
+
+        if (_checkedGitIgnoreCache.TryGetValue(workingDir, out var cachedMtime) &&
+            cachedMtime == gitignoreMtime)
+        {
+            return;
+        }
+
+        var check = await RunGitAsync(workingDir, ct, "check-ignore", "-q", ".obsync-vault/vault.json");
+        if (check.ExitCode != 0)
+        {
+            _checkedGitIgnoreCache[workingDir] = gitignoreMtime;
+            return;
+        }
+
         var lines = File.Exists(gitignorePath)
             ? File.ReadAllLines(gitignorePath).ToList()
             : [];
@@ -289,6 +482,7 @@ public sealed class GitSyncService
         if (!lines.Contains("!.obsync-vault/")) lines.Add("!.obsync-vault/");
         if (!lines.Contains("!.obsync-vault/**")) lines.Add("!.obsync-vault/**");
         File.WriteAllLines(gitignorePath, lines);
+        _checkedGitIgnoreCache[workingDir] = File.GetLastWriteTimeUtc(gitignorePath);
     }
 
     private static string SelectRemoteName(string remotesStdOut)
@@ -302,6 +496,14 @@ public sealed class GitSyncService
 
     private async Task<bool> IsRebaseInProgressAsync(string workingDir, CancellationToken ct)
     {
+        // Fast filesystem check for standard .git directory without spawning git.exe
+        var defaultGitDir = Path.Combine(workingDir, ".git");
+        if (Directory.Exists(defaultGitDir))
+        {
+            return Directory.Exists(Path.Combine(defaultGitDir, "rebase-merge")) ||
+                   Directory.Exists(Path.Combine(defaultGitDir, "rebase-apply"));
+        }
+
         var gitDirRes = await RunGitAsync(workingDir, ct, "rev-parse", "--git-dir");
         var gitDir = gitDirRes.ExitCode == 0 && !string.IsNullOrWhiteSpace(gitDirRes.StdOut)
             ? gitDirRes.StdOut.Trim()
@@ -332,6 +534,10 @@ public sealed class GitSyncService
         };
         psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
         psi.Environment["GCM_INTERACTIVE"] = "never";
+
+        // Defense-in-depth: never permit arbitrary command execution via ext:: transport
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("protocol.ext.allow=never");
         foreach (var arg in args)
         {
             psi.ArgumentList.Add(arg);
@@ -360,6 +566,10 @@ public sealed class GitSyncService
             catch
             {
             }
+
+            // Observe faulted/canceled reader tasks cleanly
+            _ = stdoutTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            _ = stderrTask.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
 
             if (ct.IsCancellationRequested)
             {

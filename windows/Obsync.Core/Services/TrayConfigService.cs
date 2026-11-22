@@ -12,6 +12,8 @@ public sealed class TrayConfigService
         PropertyNameCaseInsensitive = true
     };
 
+    private readonly object _saveLock = new();
+
     public string ConfigPath { get; }
     public string LegacyConfigPath { get; }
 
@@ -29,10 +31,25 @@ public sealed class TrayConfigService
     {
         if (File.Exists(ConfigPath))
         {
-            var json = File.ReadAllText(ConfigPath);
-            if (!string.IsNullOrWhiteSpace(json))
+            try
             {
-                return JsonSerializer.Deserialize<TrayConfig>(json, JsonOptions) ?? new TrayConfig();
+                var json = File.ReadAllText(ConfigPath);
+                if (!string.IsNullOrWhiteSpace(json))
+                {
+                    return JsonSerializer.Deserialize<TrayConfig>(json, JsonOptions) ?? new TrayConfig();
+                }
+            }
+            catch (Exception ex) when (ex is JsonException or IOException)
+            {
+                // Preserve corrupted config for diagnostics and recover gracefully instead of crashing
+                try
+                {
+                    File.Copy(ConfigPath, ConfigPath + ".corrupt", overwrite: true);
+                }
+                catch
+                {
+                }
+                return new TrayConfig();
             }
         }
 
@@ -73,16 +90,19 @@ public sealed class TrayConfigService
 
     public void Save(TrayConfig config)
     {
-        var dir = Path.GetDirectoryName(ConfigPath);
-        if (!string.IsNullOrEmpty(dir))
+        lock (_saveLock)
         {
-            Directory.CreateDirectory(dir);
-        }
+            var dir = Path.GetDirectoryName(ConfigPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
 
-        var tmpPath = ConfigPath + ".tmp";
-        var json = JsonSerializer.Serialize(config, JsonOptions);
-        File.WriteAllText(tmpPath, json);
-        File.Move(tmpPath, ConfigPath, overwrite: true);
+            var tmpPath = $"{ConfigPath}.{Guid.NewGuid():N}.tmp";
+            var json = JsonSerializer.Serialize(config, JsonOptions);
+            File.WriteAllText(tmpPath, json);
+            File.Move(tmpPath, ConfigPath, overwrite: true);
+        }
     }
 
     private sealed class LegacyAppConfig

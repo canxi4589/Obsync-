@@ -163,4 +163,69 @@ public sealed class GitSyncServiceTests : IDisposable
         Assert.False(res.HadChanges);
         Assert.Equal("Already up to date.", res.Summary);
     }
+
+    [Fact]
+    public void TryValidateRemoteUrl_BlocksArgumentInjectionAndDangerousSchemes()
+    {
+        Assert.True(GitSyncService.TryValidateRemoteUrl("https://github.com/alice/vault.git", out _));
+        Assert.True(GitSyncService.TryValidateRemoteUrl("ssh://git@github.com/alice/vault.git", out _));
+        Assert.True(GitSyncService.TryValidateRemoteUrl("git@github.com:alice/vault.git", out _));
+
+        Assert.False(GitSyncService.TryValidateRemoteUrl("--upload-pack=calc.exe", out _));
+        Assert.False(GitSyncService.TryValidateRemoteUrl("-u", out _));
+        Assert.False(GitSyncService.TryValidateRemoteUrl("ext::sh -c calc", out _));
+        Assert.False(GitSyncService.TryValidateRemoteUrl("file:///C:/Windows/System32", out _));
+        Assert.False(GitSyncService.TryValidateRemoteUrl("http://insecure.example.com/repo.git", out _));
+        Assert.False(GitSyncService.TryValidateRemoteUrl("https://github.com/a b.git", out _));
+    }
+
+    [Fact]
+    public void RedactCredentials_MasksEmbeddedUrlTokens()
+    {
+        var raw = "fatal: unable to access 'https://alice:github_pat_secret123@github.com/alice/vault.git/': 403";
+        var redacted = GitSyncService.RedactCredentials(raw);
+        Assert.DoesNotContain("github_pat_secret123", redacted);
+        Assert.Contains("https://***@github.com/alice/vault.git/", redacted);
+    }
+
+    [Fact]
+    public async Task TwoWaySync_ExcludesRecoveryKeyAndEnvFilesFromAutoCommit()
+    {
+        var (_, cloneA, cloneB) = SetupRepoPair();
+
+        await File.WriteAllTextAsync(Path.Combine(cloneA, "normal-note.md"), "# Safe Note");
+        await File.WriteAllTextAsync(Path.Combine(cloneA, "obsync-recovery-key.txt"), "OBSYNC-SECRET-KEY");
+        await File.WriteAllTextAsync(Path.Combine(cloneA, ".env"), "API_KEY=supersecret");
+
+        var res = await _syncService.SyncVaultAsync(new VaultEntry
+        {
+            Name = "SecretGuardVault",
+            Path = cloneA
+        });
+
+        Assert.True(res.Success, res.ErrorDetails);
+        Assert.True(res.HadChanges);
+
+        // Pull on Clone B: normal note arrived, but recovery key & .env were never committed/pushed
+        RunGit(cloneB, "pull", "--rebase");
+        Assert.True(File.Exists(Path.Combine(cloneB, "normal-note.md")));
+        Assert.False(File.Exists(Path.Combine(cloneB, "obsync-recovery-key.txt")));
+        Assert.False(File.Exists(Path.Combine(cloneB, ".env")));
+    }
+
+    [Fact]
+    public async Task TwoWaySync_RejectsMaliciousRemoteUrlBeforeRunningGit()
+    {
+        var (_, cloneA, _) = SetupRepoPair();
+
+        var res = await _syncService.SyncVaultAsync(new VaultEntry
+        {
+            Name = "BadRemoteVault",
+            Path = cloneA,
+            RemoteUrl = "ext::sh -c echo pwned"
+        });
+
+        Assert.False(res.Success);
+        Assert.Equal("Invalid git remote URL.", res.Summary);
+    }
 }
