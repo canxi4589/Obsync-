@@ -5,7 +5,14 @@
 
 # dotenv files
 .env
-RiceProduction.API/appsettings.json
+.env*.local
+
+# Node / PWA
+obsync-web/node_modules/
+obsync-web/dist/
+obsync-web/.vite/
+*.tsbuildinfo
+
 # User-specific files
 *.rsuser
 *.suo
@@ -19,9 +26,6 @@ RiceProduction.API/appsettings.json
 # Mono auto generated files
 mono_crash.*
 
-**/Infrastructure/Migrations/
-**/Infrastructure/*DbContextModelSnapshot.cs
-RiceProduction.Infrastructure/Migrations/
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
