@@ -57,7 +57,6 @@ export function getConnectionFingerprint(config: StorageProviderConfig): string 
         config.clientId,
         config.accountEmail ?? '',
         config.folderName,
-        config.rootFolderId ?? '',
       ]);
     case 'local':
       return JSON.stringify([config.type, config.id]);

@@ -230,27 +230,53 @@ export function SettingsView({
   const handleSaveEdit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingDraft) return;
-    const normalized: StorageProviderConfig =
-      editingDraft.type === 'gdrive'
-        ? {
-            ...editingDraft,
-            rootFolderId:
-              configs.find((c) => c.id === editingDraft.id && c.type === 'gdrive')
-                ?.type === 'gdrive' &&
-              (configs.find((c) => c.id === editingDraft.id) as GoogleDriveProviderConfig)
-                .folderName === editingDraft.folderName
-                ? editingDraft.rootFolderId
-                : undefined,
-          }
-        : editingDraft.type === 's3'
-          ? {
-              ...editingDraft,
-              endpoint: editingDraft.endpoint.trim().replace(/\/+$/, ''),
-              region: editingDraft.region.trim() || 'auto',
-              bucket: editingDraft.bucket.trim(),
-              prefix: editingDraft.prefix?.trim(),
-            }
-          : editingDraft;
+    const prev = configs.find((c) => c.id === editingDraft.id);
+    const trimmedLabel = editingDraft.label.trim() || editingDraft.label;
+
+    let normalized: StorageProviderConfig;
+    if (editingDraft.type === 'github') {
+      normalized = {
+        ...editingDraft,
+        label: trimmedLabel,
+        owner: editingDraft.owner.trim(),
+        repo: editingDraft.repo.trim(),
+        branch: editingDraft.branch.trim() || 'main',
+        token: editingDraft.token.trim(),
+      };
+    } else if (editingDraft.type === 'gdrive') {
+      const nextClientId = editingDraft.clientId.trim();
+      const nextFolderName = editingDraft.folderName.trim() || 'ObsyncVault';
+      const prevClientId = prev?.type === 'gdrive' ? prev.clientId : nextClientId;
+      const prevFolder = prev?.type === 'gdrive' ? prev.folderName : nextFolderName;
+      if (nextClientId !== prevClientId) {
+        clearGoogleDriveToken(editingDraft.id);
+      }
+      onDefaultGoogleClientIdChange(nextClientId);
+      normalized = {
+        ...editingDraft,
+        label: trimmedLabel,
+        clientId: nextClientId,
+        folderName: nextFolderName,
+        rootFolderId:
+          prevFolder === nextFolderName ? editingDraft.rootFolderId : undefined,
+      };
+    } else if (editingDraft.type === 's3') {
+      normalized = {
+        ...editingDraft,
+        label: trimmedLabel,
+        endpoint: editingDraft.endpoint.trim().replace(/\/+$/, ''),
+        region: editingDraft.region.trim() || 'auto',
+        bucket: editingDraft.bucket.trim(),
+        prefix: editingDraft.prefix?.trim(),
+        accessKeyId: editingDraft.accessKeyId.trim(),
+        secretAccessKey: editingDraft.secretAccessKey.trim(),
+      };
+    } else {
+      normalized = {
+        ...editingDraft,
+        label: trimmedLabel,
+      };
+    }
 
     onConfigsChange(
       configs.map((c) => (c.id === normalized.id ? normalized : c))

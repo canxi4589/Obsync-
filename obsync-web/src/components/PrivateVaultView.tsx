@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -27,12 +27,15 @@ import { MarkdownView } from './MarkdownView';
 
 interface PrivateVaultViewProps {
   vaultService: VaultService;
+  primaryKey: string;
+  isActive: boolean;
   hasProviders: boolean;
   dek: CryptoKey | null;
   meta: VaultMeta | null;
   index: VaultIndex | null;
   autoLockMinutes: number;
   onAutoLockMinutesChange: (mins: number) => void;
+  onMetaLoaded: (meta: VaultMeta | null) => void;
   onUnlockStateChange: (next: {
     dek: CryptoKey | null;
     meta: VaultMeta | null;
@@ -70,12 +73,15 @@ function downloadTextFile(filename: string, content: string): void {
 
 export function PrivateVaultView({
   vaultService,
+  primaryKey,
+  isActive,
   hasProviders,
   dek,
   meta,
   index,
   autoLockMinutes,
   onAutoLockMinutesChange,
+  onMetaLoaded,
   onUnlockStateChange,
   onDirtyChange,
   onSourceChange,
@@ -131,6 +137,8 @@ export function PrivateVaultView({
   const [legacyFolder, setLegacyFolder] = useState('private');
   const [secBusy, setSecBusy] = useState(false);
 
+  const lastCheckedKeyRef = useRef<string | null>(null);
+
   const checkVault = useCallback(async () => {
     if (!hasProviders) {
       setVaultExists(null);
@@ -142,9 +150,7 @@ export function PrivateVaultView({
       const res = await vaultService.checkVaultExists();
       onSourceChange(res.sourceLabel, res.usedFallback);
       setVaultExists(res.exists);
-      if (res.meta) {
-        onUnlockStateChange({ dek, meta: res.meta, index });
-      }
+      onMetaLoaded(res.meta);
     } catch (err) {
       setAuthError(
         err instanceof Error ? err.message : 'Unable to check private vault.'
@@ -152,16 +158,16 @@ export function PrivateVaultView({
     } finally {
       setChecking(false);
     }
-  }, [hasProviders, vaultService, dek, index, onSourceChange, onUnlockStateChange]);
+  }, [hasProviders, vaultService, onSourceChange, onMetaLoaded]);
 
   useEffect(() => {
-    if (!meta) {
-      setVaultExists(null);
-      if (hasProviders) {
-        void checkVault();
-      }
+    if (lastCheckedKeyRef.current === primaryKey) return;
+    lastCheckedKeyRef.current = primaryKey;
+    setVaultExists(null);
+    if (primaryKey) {
+      void checkVault();
     }
-  }, [meta, hasProviders, checkVault]);
+  }, [primaryKey, checkVault]);
 
   const isDirty = selectedNote !== null && draftContent !== savedContent;
 
@@ -1000,6 +1006,7 @@ export function PrivateVaultView({
             }}
             isDirty={isDirty}
             isSaving={savingNote}
+            isActive={isActive}
             headerExtra={
               <button
                 type="button"

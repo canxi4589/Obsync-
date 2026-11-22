@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { bytesToUtf8, utf8ToBytes } from '../crypto/base64';
 import { OfflineCache } from '../storage/offlineCache';
 import { StorageManager } from '../storage/storageManager';
+import { getConnectionFingerprint } from '../storage/storageManager';
 import {
   AuthExpiredError,
   type FileEntry,
+  type GoogleDriveProviderConfig,
   type LocalProviderConfig,
   type ReadResult,
   type StorageProvider,
@@ -191,5 +193,34 @@ describe('StorageManager Priority, Failover & Mirroring', () => {
     expect(res.failed).toBe(0);
     expect(p2.files.has('.git/HEAD')).toBe(false);
     expect(Array.from(p2.files.get('.obsync-vault/notes/a.enc')!)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('preserves Google Drive fingerprint and provider instance when rootFolderId is discovered', () => {
+    const gdBase: GoogleDriveProviderConfig = {
+      id: 'gd-1',
+      type: 'gdrive',
+      label: 'Drive',
+      enabled: true,
+      mirrorWrites: true,
+      clientId: 'client-1',
+      accountEmail: 'user@gmail.com',
+      folderName: 'ObsyncVault',
+    };
+    const gdWithRoot: GoogleDriveProviderConfig = {
+      ...gdBase,
+      rootFolderId: 'folder-abc',
+    };
+
+    expect(getConnectionFingerprint(gdBase)).toBe(getConnectionFingerprint(gdWithRoot));
+
+    let factoryCalls = 0;
+    const manager = new StorageManager([gdBase], new OfflineCache(), () => {
+      factoryCalls++;
+      return new MemoryMockProvider('gd-1', 'Drive');
+    });
+    expect(factoryCalls).toBe(1);
+
+    manager.setConfigs([gdWithRoot]);
+    expect(factoryCalls).toBe(1);
   });
 });

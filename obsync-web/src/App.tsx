@@ -56,6 +56,24 @@ export function App() {
   const [publicDirty, setPublicDirty] = useState(false);
   const [privateDirty, setPrivateDirty] = useState(false);
 
+  const primaryKey = useMemo(() => {
+    const p = configs.find((c) => c.enabled);
+    return p ? getConnectionFingerprint(p) : '';
+  }, [configs]);
+
+  const handleUnlockStateChange = useCallback(
+    (next: { dek: CryptoKey | null; meta: VaultMeta | null; index: VaultIndex | null }) => {
+      setDek(next.dek);
+      setMeta(next.meta);
+      setIndex(next.index);
+    },
+    []
+  );
+
+  const handleMetaLoaded = useCallback((loadedMeta: VaultMeta | null) => {
+    setMeta(loadedMeta);
+  }, []);
+
   // Toast notification
   const [toast, setToast] = useState<{
     id: number;
@@ -154,6 +172,7 @@ export function App() {
     let timerId = window.setTimeout(() => {
       setDek(null);
       setIndex(null);
+      setPrivateDirty(false);
       showToast('Private Vault auto-locked due to inactivity.');
     }, timeoutMs);
 
@@ -162,6 +181,7 @@ export function App() {
       timerId = window.setTimeout(() => {
         setDek(null);
         setIndex(null);
+        setPrivateDirty(false);
         showToast('Private Vault auto-locked due to inactivity.');
       }, timeoutMs);
     };
@@ -267,6 +287,8 @@ export function App() {
           <div className={tab === 'public' ? 'h-full' : 'hidden'}>
             <PublicNotesView
               storage={storage}
+              primaryKey={primaryKey}
+              isActive={tab === 'public'}
               hasProviders={hasEnabledProviders}
               onSourceChange={handleSourceChange}
               onDirtyChange={setPublicDirty}
@@ -278,17 +300,16 @@ export function App() {
           <div className={tab === 'private' ? 'h-full' : 'hidden'}>
             <PrivateVaultView
               vaultService={vaultService}
+              primaryKey={primaryKey}
+              isActive={tab === 'private'}
               hasProviders={hasEnabledProviders}
               dek={dek}
               meta={meta}
               index={index}
               autoLockMinutes={prefs.autoLockMinutes}
               onAutoLockMinutesChange={handleAutoLockMinutesChange}
-              onUnlockStateChange={(next) => {
-                setDek(next.dek);
-                setMeta(next.meta);
-                setIndex(next.index);
-              }}
+              onMetaLoaded={handleMetaLoaded}
+              onUnlockStateChange={handleUnlockStateChange}
               onDirtyChange={setPrivateDirty}
               onSourceChange={handleSourceChange}
               onToast={showToast}

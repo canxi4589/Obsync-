@@ -15,6 +15,8 @@ import { MarkdownView } from './MarkdownView';
 
 interface PublicNotesViewProps {
   storage: StorageManager;
+  primaryKey: string;
+  isActive: boolean;
   hasProviders: boolean;
   onSourceChange: (label: string, usedFallback: boolean) => void;
   onDirtyChange?: (dirty: boolean) => void;
@@ -24,6 +26,8 @@ interface PublicNotesViewProps {
 
 export function PublicNotesView({
   storage,
+  primaryKey,
+  isActive,
   hasProviders,
   onSourceChange,
   onDirtyChange,
@@ -81,8 +85,11 @@ export function PublicNotesView({
   };
 
   useEffect(() => {
+    setSelectedPath(null);
+    setSavedContent('');
+    setDraftContent('');
     void refreshList();
-  }, [refreshList]);
+  }, [primaryKey, refreshList]);
 
   const openNote = async (path: string) => {
     if (path === selectedPath) return;
@@ -309,6 +316,7 @@ export function PublicNotesView({
             }}
             isDirty={isDirty}
             isSaving={saving}
+            isActive={isActive}
           />
         ) : (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-slate-500">

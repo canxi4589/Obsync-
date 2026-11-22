@@ -25,6 +25,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly List<string> _logs = [];
     private readonly object _logLock = new();
     private readonly SynchronizationContext _uiContext;
+    private readonly CancellationTokenSource _shutdownCts = new();
 
     private TrayConfig _config;
     private SettingsForm? _settingsForm;
@@ -238,10 +239,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     public async Task SyncAllAsync(string trigger)
     {
-        if (!await _syncLock.WaitAsync(0))
+        if (_disposed) return;
+        bool acquired;
+        try
+        {
+            acquired = await _syncLock.WaitAsync(0);
+        }
+        catch (ObjectDisposedException)
         {
             return;
         }
+        if (!acquired) return;
 
         try
         {
@@ -258,7 +266,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _hasError = false;
             foreach (var vault in enabledVaults)
             {
-                var result = await _gitSyncService.SyncVaultAsync(vault);
+                if (_disposed) return;
+                var result = await _gitSyncService.SyncVaultAsync(vault, _shutdownCts.Token);
                 vault.LastSyncUtc = DateTime.UtcNow;
                 vault.LastStatus = result.Success ? result.Summary : $"ERROR: {result.Summary}";
 
@@ -268,7 +277,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     AppendLog($"  {result.ErrorDetails}");
                 }
 
-                if (!result.Success)
+                if (!result.Success && !_disposed)
                 {
                     _hasError = true;
                     _notifyIcon.ShowBalloonTip(
@@ -282,24 +291,45 @@ internal sealed class TrayApplicationContext : ApplicationContext
             }
 
             _configService.Save(_config);
-            UpdateTrayVisual(
-                _hasError ? TrayState.Error : TrayState.Idle,
-                _hasError ? "Last sync had errors" : $"Last sync {DateTime.Now:HH:mm}");
-            ConfigOrStatusUpdated?.Invoke();
+            if (!_disposed)
+            {
+                UpdateTrayVisual(
+                    _hasError ? TrayState.Error : TrayState.Idle,
+                    _hasError ? "Last sync had errors" : $"Last sync {DateTime.Now:HH:mm}");
+                ConfigOrStatusUpdated?.Invoke();
+            }
+        }
+        catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
+        {
+            // App shutting down cleanly
         }
         finally
         {
-            _syncLock.Release();
+            if (!_disposed)
+            {
+                try { _syncLock.Release(); } catch (ObjectDisposedException) { }
+            }
         }
     }
 
     public async Task SyncSingleVaultAsync(VaultEntry vault)
     {
-        if (!await _syncLock.WaitAsync(0)) return;
+        if (_disposed) return;
+        bool acquired;
+        try
+        {
+            acquired = await _syncLock.WaitAsync(0);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+        if (!acquired) return;
+
         try
         {
             UpdateTrayVisual(TrayState.Syncing, $"Syncing {vault.Name}...");
-            var result = await _gitSyncService.SyncVaultAsync(vault);
+            var result = await _gitSyncService.SyncVaultAsync(vault, _shutdownCts.Token);
             vault.LastSyncUtc = DateTime.UtcNow;
             vault.LastStatus = result.Success ? result.Summary : $"ERROR: {result.Summary}";
             AppendLog($"[{vault.Name}] {result.Summary}");
@@ -308,19 +338,30 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 AppendLog($"  {result.ErrorDetails}");
             }
             _configService.Save(_config);
-            UpdateTrayVisual(
-                result.Success ? TrayState.Idle : TrayState.Error,
-                result.Success ? $"Synced {vault.Name}" : $"Error on {vault.Name}");
-            ConfigOrStatusUpdated?.Invoke();
+            if (!_disposed)
+            {
+                UpdateTrayVisual(
+                    result.Success ? TrayState.Idle : TrayState.Error,
+                    result.Success ? $"Synced {vault.Name}" : $"Error on {vault.Name}");
+                ConfigOrStatusUpdated?.Invoke();
+            }
+        }
+        catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
+        {
+            // App shutting down cleanly
         }
         finally
         {
-            _syncLock.Release();
+            if (!_disposed)
+            {
+                try { _syncLock.Release(); } catch (ObjectDisposedException) { }
+            }
         }
     }
 
     private void UpdateTrayVisual(TrayState state, string statusText)
     {
+        if (_disposed) return;
         _notifyIcon.Icon = state switch
         {
             TrayState.Syncing => _syncingIcon,
@@ -365,6 +406,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing)
         {
             _disposed = true;
+            _shutdownCts.Cancel();
             _periodicTimer.Dispose();
             _debounceTimer.Dispose();
             foreach (var w in _watchers) w.Dispose();
@@ -374,7 +416,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _idleIcon.Dispose();
             _syncingIcon.Dispose();
             _errorIcon.Dispose();
-            _syncLock.Dispose();
+            _shutdownCts.Dispose();
+            if (_syncLock.CurrentCount > 0)
+            {
+                _syncLock.Dispose();
+            }
         }
         base.Dispose(disposing);
     }

@@ -33,6 +33,7 @@ interface MarkdownViewProps {
   onBack?: () => void;
   isDirty: boolean;
   isSaving: boolean;
+  isActive?: boolean;
   headerExtra?: React.ReactNode;
 }
 
@@ -48,11 +49,13 @@ export function MarkdownView({
   onBack,
   isDirty,
   isSaving,
+  isActive = true,
   headerExtra,
 }: MarkdownViewProps) {
   const [mode, setMode] = useState<ViewMode>('preview');
 
   useEffect(() => {
+    if (!isActive) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault();
@@ -63,7 +66,7 @@ export function MarkdownView({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isDirty, isSaving, onSave]);
+  }, [isActive, isDirty, isSaving, onSave]);
 
   const safeHtml = useMemo(() => {
     ensureDomPurifyHooks();

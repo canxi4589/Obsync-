@@ -351,9 +351,20 @@ public sealed class GitSyncService
             await Task.WhenAll(stdoutTask, stderrTask, proc.WaitForExitAsync(timeoutCts.Token));
             return new GitCommandResult(proc.ExitCode, stdoutTask.Result, stderrTask.Result);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            try { proc.Kill(entireProcessTree: true); } catch { }
+            try
+            {
+                if (!proc.HasExited) proc.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+            }
+
+            if (ct.IsCancellationRequested)
+            {
+                throw;
+            }
             return new GitCommandResult(-1, string.Empty, "git command timed out after 120 seconds.");
         }
     }
