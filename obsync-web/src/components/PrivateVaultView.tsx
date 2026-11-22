@@ -38,6 +38,7 @@ interface PrivateVaultViewProps {
     meta: VaultMeta | null;
     index: VaultIndex | null;
   }) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   onSourceChange: (label: string, usedFallback: boolean) => void;
   onToast: (msg: string, kind?: 'info' | 'error') => void;
   onOpenSettings: () => void;
@@ -76,6 +77,7 @@ export function PrivateVaultView({
   autoLockMinutes,
   onAutoLockMinutesChange,
   onUnlockStateChange,
+  onDirtyChange,
   onSourceChange,
   onToast,
   onOpenSettings,
@@ -153,10 +155,24 @@ export function PrivateVaultView({
   }, [hasProviders, vaultService, dek, index, onSourceChange, onUnlockStateChange]);
 
   useEffect(() => {
-    if (!meta && hasProviders) {
-      void checkVault();
+    if (!meta) {
+      setVaultExists(null);
+      if (hasProviders) {
+        void checkVault();
+      }
     }
   }, [meta, hasProviders, checkVault]);
+
+  const isDirty = selectedNote !== null && draftContent !== savedContent;
+
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  const confirmDiscardIfDirty = (): boolean => {
+    if (!isDirty) return true;
+    return window.confirm('You have unsaved changes. Discard them?');
+  };
 
   // Clear local decrypted editor buffers whenever vault locks
   useEffect(() => {
@@ -275,7 +291,8 @@ export function PrivateVaultView({
   };
 
   const openNote = async (entry: PrivateNoteEntry) => {
-    if (!dek) return;
+    if (!dek || entry.id === selectedNote?.id) return;
+    if (!confirmDiscardIfDirty()) return;
     setLoadingNote(true);
     try {
       const text = await vaultService.readPrivateNote(dek, entry.id);
@@ -337,6 +354,7 @@ export function PrivateVaultView({
   const handleCreateNote = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!dek || !index) return;
+    if (!confirmDiscardIfDirty()) return;
     const title = newTitle.trim();
     if (!title) return;
     setSavingNote(true);
@@ -478,7 +496,7 @@ export function PrivateVaultView({
   };
 
   const groupedNotes = useMemo(() => {
-    const notes = index?.notes ?? [];
+    const notes = (index?.notes ?? []).filter((n) => !n.deleted);
     const q = search.trim().toLowerCase();
     const filtered = q
       ? notes.filter(
@@ -849,7 +867,7 @@ export function PrivateVaultView({
   }
 
   // Unlocked Private Vault Workspace
-  const totalNotes = index?.notes.length ?? 0;
+  const totalNotes = (index?.notes ?? []).filter((n) => !n.deleted).length;
 
   return (
     <div className="flex h-full min-h-0">
@@ -976,8 +994,11 @@ export function PrivateVaultView({
             onChangeContent={setDraftContent}
             onSave={handleSaveNote}
             onDelete={handleDeleteNote}
-            onBack={() => setSelectedNote(null)}
-            isDirty={draftContent !== savedContent}
+            onBack={() => {
+              if (!confirmDiscardIfDirty()) return;
+              setSelectedNote(null);
+            }}
+            isDirty={isDirty}
             isSaving={savingNote}
             headerExtra={
               <button

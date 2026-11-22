@@ -1,4 +1,5 @@
 import { unzipSync, zipSync } from 'fflate';
+import { hasTraversalSegment } from './pathUtils';
 import type { StorageManager } from './storageManager';
 
 export async function exportVaultZip(
@@ -36,7 +37,7 @@ export async function importVaultZip(
 
   for (const [rawPath, bytes] of Object.entries(extracted)) {
     const cleanPath = rawPath.replace(/^\/+/, '').replace(/\\/g, '/');
-    if (!cleanPath || cleanPath.endsWith('/') || cleanPath.includes('..')) continue;
+    if (!cleanPath || cleanPath.endsWith('/') || hasTraversalSegment(cleanPath)) continue;
     await manager.write(cleanPath, bytes, `Import ${cleanPath}`);
     imported++;
   }

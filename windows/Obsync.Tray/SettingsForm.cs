@@ -54,8 +54,8 @@ internal sealed class SettingsForm : Form
         btnAdd.Click += (_, _) => AddVault();
         btnEdit.Click += (_, _) => EditSelectedVault();
         btnRemove.Click += (_, _) => RemoveSelectedVault();
-        btnSyncOne.Click += async (_, _) => await SyncSelectedVaultAsync();
-        btnSyncAll1.Click += async (_, _) => await _ctx.SyncAllAsync("Manual sync");
+        btnSyncOne.Click += async (_, _) => await RunSafeUiAsync(SyncSelectedVaultAsync);
+        btnSyncAll1.Click += async (_, _) => await RunSafeUiAsync(() => _ctx.SyncAllAsync("Manual sync"));
 
         vaultBtnBar.Controls.AddRange([btnAdd, btnEdit, btnRemove, btnSyncOne, btnSyncAll1]);
         vaultsPage.Controls.Add(_vaultList);
@@ -140,7 +140,7 @@ internal sealed class SettingsForm : Form
         };
         var btnSyncAll2 = new Button { Text = "Sync All Now", AutoSize = true };
         var btnClearLog = new Button { Text = "Clear Log", AutoSize = true };
-        btnSyncAll2.Click += async (_, _) => await _ctx.SyncAllAsync("Manual sync");
+        btnSyncAll2.Click += async (_, _) => await RunSafeUiAsync(() => _ctx.SyncAllAsync("Manual sync"));
         btnClearLog.Click += (_, _) =>
         {
             _ctx.ClearLogs();
@@ -237,6 +237,18 @@ internal sealed class SettingsForm : Form
         if (_vaultList.SelectedItems.Count == 0) return;
         var selected = (VaultEntry)_vaultList.SelectedItems[0].Tag!;
         await _ctx.SyncSingleVaultAsync(selected);
+    }
+
+    private async Task RunSafeUiAsync(Func<Task> action)
+    {
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Obsync Sync Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void SaveSyncSettings()

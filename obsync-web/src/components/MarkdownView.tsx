@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { Columns2, Edit3, Eye, Save, Trash2 } from 'lucide-react';
@@ -7,6 +7,21 @@ marked.setOptions({
   breaks: true,
   gfm: true,
 });
+
+let hookRegistered = false;
+function ensureDomPurifyHooks(): void {
+  if (hookRegistered || typeof DOMPurify.addHook !== 'function') return;
+  hookRegistered = true;
+  DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+    if (node.tagName === 'A') {
+      const href = node.getAttribute('href') ?? '';
+      if (/^https?:\/\//i.test(href)) {
+        node.setAttribute('target', '_blank');
+        node.setAttribute('rel', 'noopener noreferrer');
+      }
+    }
+  });
+}
 
 interface MarkdownViewProps {
   title: string;
@@ -37,7 +52,21 @@ export function MarkdownView({
 }: MarkdownViewProps) {
   const [mode, setMode] = useState<ViewMode>('preview');
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (isDirty && !isSaving) {
+          void onSave();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isDirty, isSaving, onSave]);
+
   const safeHtml = useMemo(() => {
+    ensureDomPurifyHooks();
     const raw = marked.parse(content || '*Empty note*', { async: false });
     return DOMPurify.sanitize(typeof raw === 'string' ? raw : '');
   }, [content]);

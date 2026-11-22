@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
@@ -9,6 +9,7 @@ import {
   FolderOpen,
   Github,
   HardDrive,
+  Pencil,
   Plus,
   RefreshCw,
   Server,
@@ -20,6 +21,7 @@ import {
   authorizeGoogleDriveAccount,
   clearGoogleDriveToken,
   getGoogleDriveTokenStatus,
+  GoogleDriveProvider,
 } from '../storage/providers/googleDriveProvider';
 import { LocalFolderProvider } from '../storage/providers/localFolderProvider';
 import type { StorageManager } from '../storage/storageManager';
@@ -68,8 +70,15 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [showAdd, setShowAdd] = useState(false);
   const [addType, setAddType] = useState<ProviderType>('github');
+  const [editingDraft, setEditingDraft] = useState<StorageProviderConfig | null>(null);
+  const [, setTick] = useState(0);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [mirrorProgress, setMirrorProgress] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((t) => t + 1), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // Add GitHub form
   const [ghLabel, setGhLabel] = useState('GitHub Primary');
@@ -136,10 +145,31 @@ export function SettingsView({
     onToast(`Removed ${cfg.label}`);
   };
 
+  const syncDriveRootFolderId = (providerId: string, baseConfigs: StorageProviderConfig[]) => {
+    const provider = storage.getProvider(providerId);
+    if (!(provider instanceof GoogleDriveProvider)) return baseConfigs;
+    const rootId = provider.getRootFolderId();
+    if (!rootId) return baseConfigs;
+
+    let changed = false;
+    const next = baseConfigs.map((c) => {
+      if (c.id === providerId && c.type === 'gdrive' && c.rootFolderId !== rootId) {
+        changed = true;
+        return { ...c, rootFolderId: rootId };
+      }
+      return c;
+    });
+    return changed ? next : baseConfigs;
+  };
+
   const handleTest = async (id: string) => {
     setBusyId(id);
     try {
       const res = await storage.testProvider(id);
+      if (res.ok) {
+        const updated = syncDriveRootFolderId(id, configs);
+        if (updated !== configs) onConfigsChange(updated);
+      }
       onToast(res.details, res.ok ? 'info' : 'error');
     } finally {
       setBusyId(null);
@@ -155,23 +185,25 @@ export function SettingsView({
           cfg.clientId,
           cfg.accountEmail
         );
+        let nextConfigs = configs;
         if (token.email && token.email !== cfg.accountEmail) {
-          onConfigsChange(
-            configs.map((c) =>
-              c.id === cfg.id && c.type === 'gdrive'
-                ? {
-                    ...c,
-                    accountEmail: token.email,
-                    label:
-                      c.label.startsWith('Google Drive')
-                        ? `Google Drive (${token.email})`
-                        : c.label,
-                  }
-                : c
-            )
+          nextConfigs = nextConfigs.map((c) =>
+            c.id === cfg.id && c.type === 'gdrive'
+              ? {
+                  ...c,
+                  accountEmail: token.email,
+                  label: c.label.startsWith('Google Drive')
+                    ? `Google Drive (${token.email})`
+                    : c.label,
+                }
+              : c
           );
         }
         await storage.testProvider(cfg.id);
+        nextConfigs = syncDriveRootFolderId(cfg.id, nextConfigs);
+        if (nextConfigs !== configs) {
+          onConfigsChange(nextConfigs);
+        }
         onToast(`Connected ${token.email ?? cfg.label}`);
       } else if (cfg.type === 'local') {
         const provider = storage.getProvider(cfg.id);
@@ -193,6 +225,38 @@ export function SettingsView({
     } finally {
       setBusyId(null);
     }
+  };
+
+  const handleSaveEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingDraft) return;
+    const normalized: StorageProviderConfig =
+      editingDraft.type === 'gdrive'
+        ? {
+            ...editingDraft,
+            rootFolderId:
+              configs.find((c) => c.id === editingDraft.id && c.type === 'gdrive')
+                ?.type === 'gdrive' &&
+              (configs.find((c) => c.id === editingDraft.id) as GoogleDriveProviderConfig)
+                .folderName === editingDraft.folderName
+                ? editingDraft.rootFolderId
+                : undefined,
+          }
+        : editingDraft.type === 's3'
+          ? {
+              ...editingDraft,
+              endpoint: editingDraft.endpoint.trim().replace(/\/+$/, ''),
+              region: editingDraft.region.trim() || 'auto',
+              bucket: editingDraft.bucket.trim(),
+              prefix: editingDraft.prefix?.trim(),
+            }
+          : editingDraft;
+
+    onConfigsChange(
+      configs.map((c) => (c.id === normalized.id ? normalized : c))
+    );
+    setEditingDraft(null);
+    onToast(`Updated ${normalized.label}`);
   };
 
   const handleAddGitHub = (e: React.FormEvent) => {
@@ -548,6 +612,15 @@ export function SettingsView({
                             Reconnect
                           </button>
                         )}
+                        <button
+                          type="button"
+                          onClick={() => setEditingDraft({ ...cfg })}
+                          className="flex items-center gap-1 rounded-lg border border-slate-700 px-2.5 py-1 text-slate-300 hover:bg-slate-800"
+                          title="Edit provider settings"
+                        >
+                          <Pencil className="h-3 w-3" />
+                          <span>Edit</span>
+                        </button>
                         <button
                           type="button"
                           disabled={busyId === cfg.id}
@@ -913,6 +986,199 @@ export function SettingsView({
               </form>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Edit Provider Modal */}
+      {editingDraft && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
+          <form
+            onSubmit={handleSaveEdit}
+            className="max-h-[90vh] w-full max-w-lg space-y-3 overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-5 shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-base font-semibold text-slate-100">
+                Edit Provider
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingDraft(null)}
+                className="rounded-lg px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-white"
+              >
+                Cancel
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400">Label</label>
+              <input
+                type="text"
+                required
+                value={editingDraft.label}
+                onChange={(e) =>
+                  setEditingDraft({ ...editingDraft, label: e.target.value })
+                }
+                className="mt-1 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+              />
+            </div>
+
+            {editingDraft.type === 'github' && (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    required
+                    value={editingDraft.owner}
+                    onChange={(e) =>
+                      setEditingDraft({ ...editingDraft, owner: e.target.value })
+                    }
+                    placeholder="Owner"
+                    className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                  <input
+                    type="text"
+                    required
+                    value={editingDraft.repo}
+                    onChange={(e) =>
+                      setEditingDraft({ ...editingDraft, repo: e.target.value })
+                    }
+                    placeholder="Repository"
+                    className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                </div>
+                <input
+                  type="text"
+                  required
+                  value={editingDraft.branch}
+                  onChange={(e) =>
+                    setEditingDraft({ ...editingDraft, branch: e.target.value })
+                  }
+                  placeholder="Branch"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+                <input
+                  type="password"
+                  required
+                  value={editingDraft.token}
+                  onChange={(e) =>
+                    setEditingDraft({ ...editingDraft, token: e.target.value })
+                  }
+                  placeholder="Fine-Grained PAT"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </>
+            )}
+
+            {editingDraft.type === 'gdrive' && (
+              <>
+                <input
+                  type="text"
+                  required
+                  value={editingDraft.clientId}
+                  onChange={(e) =>
+                    setEditingDraft({ ...editingDraft, clientId: e.target.value })
+                  }
+                  placeholder="Google OAuth Client ID"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+                <input
+                  type="text"
+                  required
+                  value={editingDraft.folderName}
+                  onChange={(e) =>
+                    setEditingDraft({ ...editingDraft, folderName: e.target.value })
+                  }
+                  placeholder="Drive Folder Name"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </>
+            )}
+
+            {editingDraft.type === 's3' && (
+              <>
+                <input
+                  type="url"
+                  required
+                  value={editingDraft.endpoint}
+                  onChange={(e) =>
+                    setEditingDraft({ ...editingDraft, endpoint: e.target.value })
+                  }
+                  placeholder="Endpoint URL"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+                <div className="grid grid-cols-3 gap-2">
+                  <input
+                    type="text"
+                    required
+                    value={editingDraft.region}
+                    onChange={(e) =>
+                      setEditingDraft({ ...editingDraft, region: e.target.value })
+                    }
+                    placeholder="Region"
+                    className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                  <input
+                    type="text"
+                    required
+                    value={editingDraft.bucket}
+                    onChange={(e) =>
+                      setEditingDraft({ ...editingDraft, bucket: e.target.value })
+                    }
+                    placeholder="Bucket"
+                    className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                  <input
+                    type="text"
+                    value={editingDraft.prefix ?? ''}
+                    onChange={(e) =>
+                      setEditingDraft({ ...editingDraft, prefix: e.target.value })
+                    }
+                    placeholder="Prefix"
+                    className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                </div>
+                <input
+                  type="text"
+                  required
+                  value={editingDraft.accessKeyId}
+                  onChange={(e) =>
+                    setEditingDraft({ ...editingDraft, accessKeyId: e.target.value })
+                  }
+                  placeholder="Access Key ID"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+                <input
+                  type="password"
+                  required
+                  value={editingDraft.secretAccessKey}
+                  onChange={(e) =>
+                    setEditingDraft({
+                      ...editingDraft,
+                      secretAccessKey: e.target.value,
+                    })
+                  }
+                  placeholder="Secret Access Key"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setEditingDraft(null)}
+                className="rounded-xl border border-slate-700 px-3.5 py-1.5 text-sm text-slate-300 hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="rounded-xl bg-indigo-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-indigo-500"
+              >
+                Save Changes
+              </button>
+            </div>
+          </form>
         </div>
       )}
 

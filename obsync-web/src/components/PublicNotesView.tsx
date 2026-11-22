@@ -8,6 +8,7 @@ import {
   Settings,
 } from 'lucide-react';
 import { bytesToUtf8, utf8ToBytes } from '../crypto/base64';
+import { validatePublicNotePath } from '../storage/pathUtils';
 import type { StorageManager } from '../storage/storageManager';
 import type { FileEntry } from '../storage/types';
 import { MarkdownView } from './MarkdownView';
@@ -16,6 +17,7 @@ interface PublicNotesViewProps {
   storage: StorageManager;
   hasProviders: boolean;
   onSourceChange: (label: string, usedFallback: boolean) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   onToast: (msg: string, kind?: 'info' | 'error') => void;
   onOpenSettings: () => void;
 }
@@ -24,6 +26,7 @@ export function PublicNotesView({
   storage,
   hasProviders,
   onSourceChange,
+  onDirtyChange,
   onToast,
   onOpenSettings,
 }: PublicNotesViewProps) {
@@ -66,11 +69,24 @@ export function PublicNotesView({
     }
   }, [hasProviders, storage, onSourceChange, onToast]);
 
+  const isDirty = selectedPath !== null && draftContent !== savedContent;
+
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  const confirmDiscardIfDirty = (): boolean => {
+    if (!isDirty) return true;
+    return window.confirm('You have unsaved changes. Discard them?');
+  };
+
   useEffect(() => {
     void refreshList();
   }, [refreshList]);
 
   const openNote = async (path: string) => {
+    if (path === selectedPath) return;
+    if (!confirmDiscardIfDirty()) return;
     try {
       const res = await storage.read(path);
       onSourceChange(res.sourceLabel, res.usedFallback);
@@ -124,9 +140,13 @@ export function PublicNotesView({
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    let clean = newPathInput.trim().replace(/\\/g, '/').replace(/^\/+/, '');
-    if (!clean) return;
-    if (!clean.toLowerCase().endsWith('.md')) clean += '.md';
+    if (!confirmDiscardIfDirty()) return;
+    const validated = validatePublicNotePath(newPathInput);
+    if (!validated.ok) {
+      onToast(validated.error, 'error');
+      return;
+    }
+    const clean = validated.path;
 
     setSaving(true);
     try {
@@ -283,8 +303,11 @@ export function PublicNotesView({
             onChangeContent={setDraftContent}
             onSave={handleSave}
             onDelete={handleDelete}
-            onBack={() => setSelectedPath(null)}
-            isDirty={draftContent !== savedContent}
+            onBack={() => {
+              if (!confirmDiscardIfDirty()) return;
+              setSelectedPath(null);
+            }}
+            isDirty={isDirty}
             isSaving={saving}
           />
         ) : (

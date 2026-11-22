@@ -24,16 +24,19 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly List<FileSystemWatcher> _watchers = [];
     private readonly List<string> _logs = [];
     private readonly object _logLock = new();
+    private readonly SynchronizationContext _uiContext;
 
     private TrayConfig _config;
     private SettingsForm? _settingsForm;
     private bool _hasError;
+    private bool _disposed;
 
     public event Action<string>? LogAppended;
     public event Action? ConfigOrStatusUpdated;
 
     public TrayApplicationContext()
     {
+        _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         _config = _configService.Load();
 
         _idleIcon = TrayIconFactory.CreateStatusIcon(TrayState.Idle);
@@ -51,7 +54,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Sync Now", null, async (_, _) => await SyncAllAsync("Manual sync"));
+        menu.Items.Add("Sync Now", null, async (_, _) => await RunSafeAsync(() => SyncAllAsync("Manual sync"), "Manual sync"));
         menu.Items.Add(_vaultsMenu);
         menu.Items.Add("Settings...", null, (_, _) => OpenSettings());
         menu.Items.Add(_startupItem);
@@ -68,13 +71,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _notifyIcon.DoubleClick += (_, _) => OpenSettings();
 
         _periodicTimer = new System.Windows.Forms.Timer();
-        _periodicTimer.Tick += async (_, _) => await SyncAllAsync("Scheduled sync");
+        _periodicTimer.Tick += async (_, _) => await RunSafeAsync(() => SyncAllAsync("Scheduled sync"), "Scheduled sync");
 
         _debounceTimer = new System.Windows.Forms.Timer { Interval = 15_000 };
         _debounceTimer.Tick += async (_, _) =>
         {
             _debounceTimer.Stop();
-            await SyncAllAsync("File change detected");
+            await RunSafeAsync(() => SyncAllAsync("File change detected"), "Auto sync");
         };
 
         ApplyConfigRuntime();
@@ -119,7 +122,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private void ApplyConfigRuntime()
     {
         RebuildVaultsMenu();
-        _startupItem.Checked = StartupRegistryService.IsEnabled() || _config.StartWithWindows;
+        var actualStartup = StartupRegistryService.IsEnabled();
+        _config.StartWithWindows = actualStartup;
+        _startupItem.Checked = actualStartup;
 
         _periodicTimer.Stop();
         if (_config.AutoSyncIntervalMinutes > 0)
@@ -150,7 +155,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
             {
                 if (Directory.Exists(vaultPath))
                 {
-                    Process.Start(new ProcessStartInfo("explorer.exe", vaultPath) { UseShellExecute = true });
+                    var psi = new ProcessStartInfo("explorer.exe") { UseShellExecute = false };
+                    psi.ArgumentList.Add(vaultPath);
+                    Process.Start(psi);
                 }
             };
             _vaultsMenu.DropDownItems.Add(item);
@@ -197,17 +204,36 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void OnVaultFileEvent(string fullPath)
     {
+        if (_disposed) return;
         if (fullPath.Contains(@"\.git\", StringComparison.OrdinalIgnoreCase) ||
             fullPath.EndsWith(@"\.git", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
 
-        _notifyIcon.ContextMenuStrip?.BeginInvoke(() =>
+        _uiContext.Post(_ =>
         {
+            if (_disposed) return;
             _debounceTimer.Stop();
             _debounceTimer.Start();
-        });
+        }, null);
+    }
+
+    private async Task RunSafeAsync(Func<Task> action, string contextName)
+    {
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            _hasError = true;
+            AppendLog($"{contextName} failed: {ex.Message}");
+            if (!_disposed)
+            {
+                UpdateTrayVisual(TrayState.Error, $"{contextName} error");
+            }
+        }
     }
 
     public async Task SyncAllAsync(string trigger)
@@ -338,6 +364,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         if (disposing)
         {
+            _disposed = true;
             _periodicTimer.Dispose();
             _debounceTimer.Dispose();
             foreach (var w in _watchers) w.Dispose();

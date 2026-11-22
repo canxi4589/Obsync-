@@ -1,4 +1,4 @@
-const CACHE_NAME = 'obsync-shell-v1';
+const CACHE_NAME = 'obsync-shell-v2';
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 const BYPASS_HOSTS = [
@@ -52,7 +52,24 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static assets: stale-while-revalidate
+  // Immutable hashed Vite assets: cache-first
+  if (url.pathname.includes('/assets/')) {
+    event.respondWith(
+      caches.match(req).then((cached) => {
+        if (cached) return cached;
+        return fetch(req).then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+          }
+          return res;
+        });
+      })
+    );
+    return;
+  }
+
+  // Other static assets (icons, manifest): stale-while-revalidate
   event.respondWith(
     caches.match(req).then((cached) => {
       const networkFetch = fetch(req)

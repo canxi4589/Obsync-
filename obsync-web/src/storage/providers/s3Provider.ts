@@ -45,6 +45,19 @@ function encodePathSegments(pathname: string): string {
     .join('/');
 }
 
+function canonicalizeEncodedPathname(pathname: string): string {
+  return pathname
+    .split('/')
+    .map((seg) => {
+      try {
+        return encodeRfc3986(decodeURIComponent(seg));
+      } catch {
+        return encodeRfc3986(seg);
+      }
+    })
+    .join('/');
+}
+
 export async function signAwsV4Headers(params: {
   method: string;
   url: URL;
@@ -60,12 +73,21 @@ export async function signAwsV4Headers(params: {
   const dateStamp = amzDate.slice(0, 8);
   const payloadHash = await sha256Hex(params.payload);
 
-  const canonicalUri = encodePathSegments(params.url.pathname) || '/';
+  const canonicalUri = canonicalizeEncodedPathname(params.url.pathname) || '/';
   const queryPairs = Array.from(params.url.searchParams.entries())
+    .map(([k, v]) => [encodeRfc3986(k), encodeRfc3986(v)] as const)
     .sort(([aKey, aVal], [bKey, bVal]) =>
-      aKey === bKey ? aVal.localeCompare(bVal) : aKey.localeCompare(bKey)
+      aKey < bKey
+        ? -1
+        : aKey > bKey
+          ? 1
+          : aVal < bVal
+            ? -1
+            : aVal > bVal
+              ? 1
+              : 0
     )
-    .map(([k, v]) => `${encodeRfc3986(k)}=${encodeRfc3986(v)}`)
+    .map(([k, v]) => `${k}=${v}`)
     .join('&');
 
   const host = params.url.host;

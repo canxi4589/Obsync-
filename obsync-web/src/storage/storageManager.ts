@@ -41,6 +41,39 @@ interface ManagedEntry {
   provider: StorageProvider;
 }
 
+export function getConnectionFingerprint(config: StorageProviderConfig): string {
+  switch (config.type) {
+    case 'github':
+      return JSON.stringify([
+        config.type,
+        config.owner,
+        config.repo,
+        config.branch,
+        config.token,
+      ]);
+    case 'gdrive':
+      return JSON.stringify([
+        config.type,
+        config.clientId,
+        config.accountEmail ?? '',
+        config.folderName,
+        config.rootFolderId ?? '',
+      ]);
+    case 'local':
+      return JSON.stringify([config.type, config.id]);
+    case 's3':
+      return JSON.stringify([
+        config.type,
+        config.endpoint,
+        config.region,
+        config.bucket,
+        config.prefix ?? '',
+        config.accessKeyId,
+        config.secretAccessKey,
+      ]);
+  }
+}
+
 export class StorageManager {
   readonly cache: OfflineCache;
   private entries: ManagedEntry[] = [];
@@ -68,10 +101,22 @@ export class StorageManager {
   }
 
   setConfigs(configs: StorageProviderConfig[]): void {
-    this.entries = configs.map((config) => ({
-      config,
-      provider: this.factory(config, this.cache),
-    }));
+    const previousById = new Map(this.entries.map((e) => [e.config.id, e]));
+
+    this.entries = configs.map((config) => {
+      const existing = previousById.get(config.id);
+      if (
+        existing &&
+        getConnectionFingerprint(existing.config) ===
+          getConnectionFingerprint(config)
+      ) {
+        return { config, provider: existing.provider };
+      }
+      return {
+        config,
+        provider: this.factory(config, this.cache),
+      };
+    });
 
     const validIds = new Set(configs.map((c) => c.id));
     for (const key of this.statuses.keys()) {
@@ -199,20 +244,20 @@ export class StorageManager {
 
     const warnings: string[] = [];
     for (let i = 0; i < enabled.length; i++) {
-      const { provider } = enabled[i];
+      const { config, provider } = enabled[i];
       try {
         const entries = await provider.list(prefix);
         this.markSuccess(provider.id);
         return {
           entries,
           sourceProviderId: provider.id,
-          sourceLabel: provider.label,
+          sourceLabel: config.label,
           usedFallback: i > 0,
           warnings,
         };
       } catch (err) {
         const msg = this.markError(provider.id, err);
-        warnings.push(`${provider.label}: ${msg}`);
+        warnings.push(`${config.label}: ${msg}`);
       }
     }
 
@@ -248,10 +293,10 @@ export class StorageManager {
     );
 
     for (let i = 0; i < enabled.length; i++) {
-      const { provider } = enabled[i];
+      const { config, provider } = enabled[i];
       if (pendingSet.has(provider.id)) {
         warnings.push(
-          `${provider.label}: skipped because a newer change is pending sync`
+          `${config.label}: skipped because a newer change is pending sync`
         );
         continue;
       }
@@ -264,7 +309,7 @@ export class StorageManager {
           return {
             data: null,
             sourceProviderId: provider.id,
-            sourceLabel: provider.label,
+            sourceLabel: config.label,
             usedFallback: i > 0,
             warnings,
           };
@@ -276,13 +321,13 @@ export class StorageManager {
           data: buf,
           etag: res.etag,
           sourceProviderId: provider.id,
-          sourceLabel: provider.label,
+          sourceLabel: config.label,
           usedFallback: i > 0,
           warnings,
         };
       } catch (err) {
         const msg = this.markError(provider.id, err);
-        warnings.push(`${provider.label}: ${msg}`);
+        warnings.push(`${config.label}: ${msg}`);
       }
     }
 
@@ -328,7 +373,7 @@ export class StorageManager {
           primaryWritten = entry;
           primaryUsedFallback = i > 0;
         } else {
-          mirroredTo.push(provider.label);
+          mirroredTo.push(config.label);
         }
       } catch (err) {
         const reason = this.markError(provider.id, err);
@@ -342,7 +387,7 @@ export class StorageManager {
           createdAt: new Date().toISOString(),
           lastError: reason,
         });
-        queuedFor.push({ providerId: provider.id, label: provider.label, reason });
+        queuedFor.push({ providerId: provider.id, label: config.label, reason });
       }
     }
 
@@ -357,7 +402,7 @@ export class StorageManager {
 
     return {
       primaryWrittenProviderId: primaryWritten.provider.id,
-      primaryWrittenLabel: primaryWritten.provider.label,
+      primaryWrittenLabel: primaryWritten.config.label,
       usedFallback: primaryUsedFallback,
       mirroredTo,
       queuedFor,
@@ -393,7 +438,7 @@ export class StorageManager {
           primaryWritten = entry;
           primaryUsedFallback = i > 0;
         } else {
-          mirroredTo.push(provider.label);
+          mirroredTo.push(config.label);
         }
       } catch (err) {
         const reason = this.markError(provider.id, err);
@@ -406,7 +451,7 @@ export class StorageManager {
           createdAt: new Date().toISOString(),
           lastError: reason,
         });
-        queuedFor.push({ providerId: provider.id, label: provider.label, reason });
+        queuedFor.push({ providerId: provider.id, label: config.label, reason });
       }
     }
 
@@ -421,7 +466,7 @@ export class StorageManager {
 
     return {
       primaryWrittenProviderId: primaryWritten.provider.id,
-      primaryWrittenLabel: primaryWritten.provider.label,
+      primaryWrittenLabel: primaryWritten.config.label,
       usedFallback: primaryUsedFallback,
       mirroredTo,
       queuedFor,
@@ -464,7 +509,7 @@ export class StorageManager {
       } catch (err) {
         const msg = this.markError(entry.provider.id, err);
         await this.cache.enqueueMirrorOp({ ...op, lastError: msg });
-        errors.push(`${entry.provider.label} (${op.path}): ${msg}`);
+        errors.push(`${entry.config.label} (${op.path}): ${msg}`);
       }
     }
 

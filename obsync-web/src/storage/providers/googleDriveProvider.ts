@@ -197,6 +197,7 @@ export class GoogleDriveProvider implements StorageProvider {
   private readonly config: GoogleDriveProviderConfig;
   private readonly folderIdCache = new Map<string, string>();
   private readonly fileIdCache = new Map<string, string>();
+  private readonly pendingDirOps = new Map<string, Promise<string | null>>();
 
   constructor(config: GoogleDriveProviderConfig) {
     this.config = config;
@@ -205,6 +206,10 @@ export class GoogleDriveProvider implements StorageProvider {
     if (config.rootFolderId) {
       this.folderIdCache.set('', config.rootFolderId);
     }
+  }
+
+  getRootFolderId(): string | undefined {
+    return this.folderIdCache.get('');
   }
 
   private getAccessToken(): string {
@@ -275,21 +280,40 @@ export class GoogleDriveProvider implements StorageProvider {
     return created.id;
   }
 
+  private async runDedupedDirOp(
+    cacheKey: string,
+    op: () => Promise<string | null>
+  ): Promise<string | null> {
+    const inFlight = this.pendingDirOps.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = op().finally(() => {
+      this.pendingDirOps.delete(cacheKey);
+    });
+    this.pendingDirOps.set(cacheKey, promise);
+    return promise;
+  }
+
   private async ensureRootFolder(createIfMissing: boolean): Promise<string | null> {
     const cached = this.folderIdCache.get('');
     if (cached) return cached;
 
-    const folderName = this.config.folderName || 'ObsyncVault';
-    const existing = await this.findChild('root', folderName, true);
-    if (existing) {
-      this.folderIdCache.set('', existing.id);
-      return existing.id;
-    }
-    if (!createIfMissing) return null;
+    return this.runDedupedDirOp(`__root__:${createIfMissing ? 'rw' : 'ro'}`, async () => {
+      const recheck = this.folderIdCache.get('');
+      if (recheck) return recheck;
 
-    const id = await this.createFolder('root', folderName);
-    this.folderIdCache.set('', id);
-    return id;
+      const folderName = this.config.folderName || 'ObsyncVault';
+      const existing = await this.findChild('root', folderName, true);
+      if (existing) {
+        this.folderIdCache.set('', existing.id);
+        return existing.id;
+      }
+      if (!createIfMissing) return null;
+
+      const id = await this.createFolder('root', folderName);
+      this.folderIdCache.set('', id);
+      return id;
+    });
   }
 
   private async resolveDir(
@@ -309,17 +333,30 @@ export class GoogleDriveProvider implements StorageProvider {
         continue;
       }
 
-      const found = await this.findChild(currentId, seg, true);
-      if (found) {
-        this.folderIdCache.set(currentKey, found.id);
-        currentId = found.id;
-      } else if (createIfMissing) {
-        const createdId = await this.createFolder(currentId, seg);
-        this.folderIdCache.set(currentKey, createdId);
-        currentId = createdId;
-      } else {
-        return null;
-      }
+      const parentForSeg = currentId;
+      const keyForSeg = currentKey;
+      const resolvedId = await this.runDedupedDirOp(
+        `${keyForSeg}:${createIfMissing ? 'rw' : 'ro'}`,
+        async () => {
+          const again = this.folderIdCache.get(keyForSeg);
+          if (again) return again;
+
+          const found = await this.findChild(parentForSeg, seg, true);
+          if (found) {
+            this.folderIdCache.set(keyForSeg, found.id);
+            return found.id;
+          }
+          if (createIfMissing) {
+            const createdId = await this.createFolder(parentForSeg, seg);
+            this.folderIdCache.set(keyForSeg, createdId);
+            return createdId;
+          }
+          return null;
+        }
+      );
+
+      if (!resolvedId) return null;
+      currentId = resolvedId;
     }
 
     return currentId;
@@ -450,7 +487,12 @@ export class GoogleDriveProvider implements StorageProvider {
     return concatBytes(head, data, tail);
   }
 
-  async write(path: string, data: Uint8Array): Promise<void> {
+  async write(
+    path: string,
+    data: Uint8Array,
+    message?: string,
+    attempt = 0
+  ): Promise<void> {
     const cleanPath = path.replace(/^\/+/, '');
     const parts = cleanPath.split('/').filter(Boolean);
     const fileName = parts[parts.length - 1];
@@ -480,8 +522,12 @@ export class GoogleDriveProvider implements StorageProvider {
       );
       if (res.status === 404) {
         this.fileIdCache.delete(cleanPath);
-        await this.write(cleanPath, data);
-        return;
+        this.folderIdCache.clear();
+        if (attempt < 1) {
+          await this.write(cleanPath, data, message, attempt + 1);
+          return;
+        }
+        throw new Error(`Google Drive update failed after retry (${cleanPath}, HTTP 404)`);
       }
       if (!res.ok) {
         throw new Error(`Google Drive update failed (${cleanPath}, HTTP ${res.status})`);
@@ -500,6 +546,14 @@ export class GoogleDriveProvider implements StorageProvider {
           body,
         }
       );
+      if (res.status === 404) {
+        this.fileIdCache.delete(cleanPath);
+        this.folderIdCache.clear();
+        if (attempt < 1) {
+          await this.write(cleanPath, data, message, attempt + 1);
+          return;
+        }
+      }
       if (!res.ok) {
         throw new Error(`Google Drive create failed (${cleanPath}, HTTP ${res.status})`);
       }

@@ -53,7 +53,14 @@ export class GitHubProvider implements StorageProvider {
     } catch {
       // ignore non-json error body
     }
-    if (res.status === 401 || res.status === 403) {
+    if (res.status === 401) {
+      throw new AuthExpiredError(msg);
+    }
+    if (res.status === 403) {
+      const remaining = res.headers.get('x-ratelimit-remaining');
+      if (remaining === '0' || /rate limit/i.test(msg)) {
+        throw new Error(msg);
+      }
       throw new AuthExpiredError(msg);
     }
     throw new Error(msg);
@@ -104,9 +111,17 @@ export class GitHubProvider implements StorageProvider {
       return [];
     }
     if (res.status === 404) {
-      // Could be an empty repo with no commits yet; check repo accessibility first
+      // Distinguish a genuinely empty repository from a missing/misspelled branch name
       const repoRes = await fetch(this.repoBase, { headers: this.headers(), cache: 'no-store' });
-      if (repoRes.ok) return [];
+      if (repoRes.ok) {
+        const repoJson = (await repoRes.json()) as { size?: number; default_branch?: string };
+        if ((repoJson.size ?? 0) === 0) {
+          return [];
+        }
+        throw new Error(
+          `GitHub branch "${this.config.branch || 'main'}" not found (default branch is "${repoJson.default_branch ?? 'unknown'}").`
+        );
+      }
       await this.handleError(res, 'GitHub list failed');
     }
     if (!res.ok) {

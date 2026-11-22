@@ -148,7 +148,17 @@ public sealed class GitSyncService
         if (!remoteBranchExists)
         {
             var lsRemote = await RunGitAsync(vault.Path, ct, "ls-remote", "--heads", remoteName, branch);
-            remoteBranchExists = lsRemote.ExitCode == 0 && !string.IsNullOrWhiteSpace(lsRemote.StdOut);
+            if (lsRemote.ExitCode != 0)
+            {
+                return new SyncResult(
+                    vault.Name,
+                    Success: false,
+                    HadChanges: committedLocal,
+                    HadConflict: false,
+                    Summary: "Cannot reach remote repository.",
+                    ErrorDetails: CombineOutput(lsRemote));
+            }
+            remoteBranchExists = !string.IsNullOrWhiteSpace(lsRemote.StdOut);
         }
 
         bool pulledRemote = false;
@@ -161,12 +171,13 @@ public sealed class GitSyncService
             if (pull.ExitCode != 0)
             {
                 var combined = CombineOutput(pull);
+                bool rebaseActive = await IsRebaseInProgressAsync(vault.Path, ct);
                 bool isConflict =
-                    IsRebaseInProgress(vault.Path) ||
+                    rebaseActive ||
                     combined.Contains("CONFLICT", StringComparison.OrdinalIgnoreCase) ||
                     combined.Contains("could not apply", StringComparison.OrdinalIgnoreCase);
 
-                if (IsRebaseInProgress(vault.Path))
+                if (rebaseActive)
                 {
                     await RunGitAsync(vault.Path, ct, "rebase", "--abort");
                 }
@@ -186,7 +197,7 @@ public sealed class GitSyncService
             pulledRemote = !string.Equals(headBeforePull, headAfterPull, StringComparison.Ordinal);
         }
 
-        // Push if HEAD exists
+        // Push if HEAD exists and either no upstream is set yet or local branch is ahead
         var headCheck = await RunGitAsync(vault.Path, ct, "rev-parse", "--verify", "HEAD");
         if (headCheck.ExitCode != 0)
         {
@@ -198,22 +209,34 @@ public sealed class GitSyncService
                 Summary: "Repository initialized (no commits yet).");
         }
 
-        var push = hasUpstream
-            ? await RunGitAsync(vault.Path, ct, "push")
-            : await RunGitAsync(vault.Path, ct, "push", "-u", remoteName, branch);
-
-        if (push.ExitCode != 0)
+        bool shouldPush = !hasUpstream;
+        if (!shouldPush)
         {
-            return new SyncResult(
-                vault.Name,
-                Success: false,
-                HadChanges: committedLocal || pulledRemote,
-                HadConflict: false,
-                Summary: "git push failed.",
-                ErrorDetails: CombineOutput(push));
+            var aheadCheck = await RunGitAsync(vault.Path, ct, "rev-list", "--count", "@{u}..HEAD");
+            shouldPush = aheadCheck.ExitCode != 0 ||
+                         (int.TryParse(aheadCheck.StdOut.Trim(), out int aheadCount) && aheadCount > 0);
         }
 
-        bool pushedLocal = committedLocal || !hasUpstream || !push.StdErr.Contains("Everything up-to-date", StringComparison.OrdinalIgnoreCase);
+        bool pushedLocal = false;
+        if (shouldPush)
+        {
+            var push = hasUpstream
+                ? await RunGitAsync(vault.Path, ct, "push")
+                : await RunGitAsync(vault.Path, ct, "push", "-u", remoteName, branch);
+
+            if (push.ExitCode != 0)
+            {
+                return new SyncResult(
+                    vault.Name,
+                    Success: false,
+                    HadChanges: committedLocal || pulledRemote,
+                    HadConflict: false,
+                    Summary: "git push failed.",
+                    ErrorDetails: CombineOutput(push));
+            }
+            pushedLocal = committedLocal || !hasUpstream || !push.StdErr.Contains("Everything up-to-date", StringComparison.OrdinalIgnoreCase);
+        }
+
         bool hadChanges = committedLocal || pulledRemote;
 
         string summary;
@@ -277,11 +300,18 @@ public sealed class GitSyncService
         return list.Contains("origin", StringComparer.Ordinal) ? "origin" : list[0];
     }
 
-    private static bool IsRebaseInProgress(string workingDir)
+    private async Task<bool> IsRebaseInProgressAsync(string workingDir, CancellationToken ct)
     {
-        var gitDir = Path.Combine(workingDir, ".git");
-        return Directory.Exists(Path.Combine(gitDir, "rebase-merge")) ||
-               Directory.Exists(Path.Combine(gitDir, "rebase-apply"));
+        var gitDirRes = await RunGitAsync(workingDir, ct, "rev-parse", "--git-dir");
+        var gitDir = gitDirRes.ExitCode == 0 && !string.IsNullOrWhiteSpace(gitDirRes.StdOut)
+            ? gitDirRes.StdOut.Trim()
+            : ".git";
+        var fullGitDir = Path.IsPathRooted(gitDir)
+            ? gitDir
+            : Path.GetFullPath(Path.Combine(workingDir, gitDir));
+
+        return Directory.Exists(Path.Combine(fullGitDir, "rebase-merge")) ||
+               Directory.Exists(Path.Combine(fullGitDir, "rebase-apply"));
     }
 
     private static string CombineOutput(GitCommandResult r)
@@ -300,6 +330,8 @@ public sealed class GitSyncService
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        psi.Environment["GCM_INTERACTIVE"] = "never";
         foreach (var arg in args)
         {
             psi.ArgumentList.Add(arg);
@@ -308,12 +340,22 @@ public sealed class GitSyncService
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start git executable '{_gitExe}'.");
 
-        var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = proc.StandardError.ReadToEndAsync(ct);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromMinutes(2));
 
-        await Task.WhenAll(stdoutTask, stderrTask, proc.WaitForExitAsync(ct));
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync(timeoutCts.Token);
+        var stderrTask = proc.StandardError.ReadToEndAsync(timeoutCts.Token);
 
-        return new GitCommandResult(proc.ExitCode, stdoutTask.Result, stderrTask.Result);
+        try
+        {
+            await Task.WhenAll(stdoutTask, stderrTask, proc.WaitForExitAsync(timeoutCts.Token));
+            return new GitCommandResult(proc.ExitCode, stdoutTask.Result, stderrTask.Result);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            return new GitCommandResult(-1, string.Empty, "git command timed out after 120 seconds.");
+        }
     }
 
     internal readonly record struct GitCommandResult(int ExitCode, string StdOut, string StdErr);

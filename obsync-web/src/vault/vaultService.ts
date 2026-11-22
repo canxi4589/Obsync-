@@ -38,6 +38,43 @@ export function createEmptyIndex(): VaultIndex {
   };
 }
 
+export function mergeVaultIndexes(local: VaultIndex, remote: VaultIndex): VaultIndex {
+  const byId = new Map<string, PrivateNoteEntry>();
+
+  for (const entry of remote.notes) {
+    byId.set(entry.id, entry);
+  }
+
+  for (const localEntry of local.notes) {
+    const remoteEntry = byId.get(localEntry.id);
+    if (!remoteEntry) {
+      byId.set(localEntry.id, localEntry);
+      continue;
+    }
+
+    if (localEntry.updatedAt > remoteEntry.updatedAt) {
+      byId.set(localEntry.id, localEntry);
+    } else if (remoteEntry.updatedAt > localEntry.updatedAt) {
+      byId.set(localEntry.id, remoteEntry);
+    } else {
+      // Equal timestamps: preserve tombstone if either side deleted
+      byId.set(
+        localEntry.id,
+        remoteEntry.deleted && !localEntry.deleted ? remoteEntry : localEntry
+      );
+    }
+  }
+
+  const maxUpdatedAt =
+    local.updatedAt > remote.updatedAt ? local.updatedAt : remote.updatedAt;
+
+  return {
+    version: 1,
+    updatedAt: maxUpdatedAt,
+    notes: Array.from(byId.values()),
+  };
+}
+
 function createUuid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -183,6 +220,20 @@ export class VaultService {
     return bytesToUtf8(plain);
   }
 
+  private async fetchAndMergeIndex(
+    dek: CryptoKey,
+    currentIndex: VaultIndex
+  ): Promise<VaultIndex> {
+    try {
+      const res = await this.storage.read(VAULT_INDEX_PATH);
+      if (!res.data) return currentIndex;
+      const remoteIndex = await decryptJson<VaultIndex>(dek, res.data);
+      return mergeVaultIndexes(currentIndex, remoteIndex);
+    } catch {
+      return currentIndex;
+    }
+  }
+
   async savePrivateNote(
     dek: CryptoKey,
     currentIndex: VaultIndex,
@@ -195,8 +246,9 @@ export class VaultService {
       .replace(/^\/+|\/+$/g, '');
     const now = new Date().toISOString();
 
+    const baseIndex = await this.fetchAndMergeIndex(dek, currentIndex);
     const id = input.id ?? createUuid();
-    const existing = currentIndex.notes.find((n) => n.id === id);
+    const existing = baseIndex.notes.find((n) => n.id === id);
 
     const note: PrivateNoteEntry = {
       id,
@@ -204,6 +256,7 @@ export class VaultService {
       folder: cleanFolder,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
+      deleted: false,
     };
 
     const noteCipher = await encryptBytes(dek, utf8ToBytes(input.content));
@@ -214,8 +267,8 @@ export class VaultService {
     );
 
     const nextNotes = existing
-      ? currentIndex.notes.map((n) => (n.id === id ? note : n))
-      : [...currentIndex.notes, note];
+      ? baseIndex.notes.map((n) => (n.id === id ? note : n))
+      : [...baseIndex.notes, note];
 
     const nextIndex: VaultIndex = {
       version: 1,
@@ -227,7 +280,7 @@ export class VaultService {
     const mirror = await this.storage.write(
       VAULT_INDEX_PATH,
       indexCipher,
-      `Update encrypted vault index`
+      'Update encrypted vault index'
     );
 
     return { index: nextIndex, note, mirror };
@@ -239,10 +292,26 @@ export class VaultService {
     noteId: string
   ): Promise<{ index: VaultIndex; mirror: MirrorSummary }> {
     const now = new Date().toISOString();
+    const baseIndex = await this.fetchAndMergeIndex(dek, currentIndex);
+    const existing = baseIndex.notes.find((n) => n.id === noteId);
+
+    const tombstone: PrivateNoteEntry = {
+      id: noteId,
+      title: '',
+      folder: '',
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      deleted: true,
+    };
+
+    const nextNotes = existing
+      ? baseIndex.notes.map((n) => (n.id === noteId ? tombstone : n))
+      : [...baseIndex.notes, tombstone];
+
     const nextIndex: VaultIndex = {
       version: 1,
       updatedAt: now,
-      notes: currentIndex.notes.filter((n) => n.id !== noteId),
+      notes: nextNotes,
     };
 
     await this.storage.delete(

@@ -1,6 +1,8 @@
+import { zipSync } from 'fflate';
 import { describe, expect, it } from 'vitest';
 import { bytesToUtf8, utf8ToBytes } from '../crypto/base64';
 import { OfflineCache } from '../storage/offlineCache';
+import { validatePublicNotePath } from '../storage/pathUtils';
 import { StorageManager } from '../storage/storageManager';
 import type { FileEntry, LocalProviderConfig, ReadResult, StorageProvider } from '../storage/types';
 import { exportVaultZip, importVaultZip } from '../storage/vaultZip';
@@ -71,5 +73,29 @@ describe('Vault ZIP Export / Import', () => {
 
     expect(res2.imported).toBe(3);
     expect(bytesToUtf8(dstProvider2.map.get('Public.md')!)).toBe('# Public');
+  });
+
+  it('allows filenames containing double dots while blocking traversal segments and reserved paths', async () => {
+    const zipBytes = zipSync({
+      'draft..v2.md': utf8ToBytes('# Draft v2'),
+      '../escape.md': utf8ToBytes('evil'),
+      'Notes/../secret.md': utf8ToBytes('evil'),
+    });
+
+    const provider = new InMemProvider();
+    const mgr = new StorageManager([cfg], new OfflineCache(), () => provider);
+    const res = await importVaultZip(mgr, new Uint8Array(zipBytes));
+
+    expect(res.imported).toBe(1);
+    expect(provider.map.has('draft..v2.md')).toBe(true);
+    expect(provider.map.has('../escape.md')).toBe(false);
+
+    expect(validatePublicNotePath('Journal/draft..v2')).toEqual({
+      ok: true,
+      path: 'Journal/draft..v2.md',
+    });
+    expect(validatePublicNotePath('.obsync-vault/hack.md').ok).toBe(false);
+    expect(validatePublicNotePath('../outside.md').ok).toBe(false);
+    expect(validatePublicNotePath('bad:name.md').ok).toBe(false);
   });
 });

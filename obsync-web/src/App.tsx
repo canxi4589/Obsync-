@@ -7,7 +7,10 @@ import {
   savePreferences,
   saveProviderConfigs,
 } from './storage/configStore';
-import { StorageManager } from './storage/storageManager';
+import {
+  getConnectionFingerprint,
+  StorageManager,
+} from './storage/storageManager';
 import type {
   ProviderRuntimeStatus,
   StorageProviderConfig,
@@ -50,6 +53,9 @@ export function App() {
   const [meta, setMeta] = useState<VaultMeta | null>(null);
   const [index, setIndex] = useState<VaultIndex | null>(null);
 
+  const [publicDirty, setPublicDirty] = useState(false);
+  const [privateDirty, setPrivateDirty] = useState(false);
+
   // Toast notification
   const [toast, setToast] = useState<{
     id: number;
@@ -75,14 +81,39 @@ export function App() {
 
   const handleConfigsChange = useCallback(
     (next: StorageProviderConfig[]) => {
+      const prevPrimary = configs.find((c) => c.enabled);
+      const nextPrimary = next.find((c) => c.enabled);
+      const primaryChanged =
+        (prevPrimary ? getConnectionFingerprint(prevPrimary) : null) !==
+        (nextPrimary ? getConnectionFingerprint(nextPrimary) : null);
+
       setConfigs(next);
       saveProviderConfigs(next);
       storage.setConfigs(next);
-      setActiveSourceLabel(next.find((c) => c.enabled)?.label ?? 'No storage');
+      setActiveSourceLabel(nextPrimary?.label ?? 'No storage');
       setUsedFallback(false);
+
+      if (primaryChanged) {
+        setDek(null);
+        setMeta(null);
+        setIndex(null);
+        setPrivateDirty(false);
+      }
     },
-    [storage]
+    [configs, storage]
   );
+
+  const totalPending = statuses.reduce((sum, s) => sum + s.pendingOps, 0);
+
+  useEffect(() => {
+    if (!publicDirty && !privateDirty && totalPending === 0) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [publicDirty, privateDirty, totalPending]);
 
   const handleAutoLockMinutesChange = useCallback(
     (mins: number) => {
@@ -103,10 +134,17 @@ export function App() {
   );
 
   const handleLockVault = useCallback(() => {
+    if (
+      privateDirty &&
+      !window.confirm('You have unsaved changes in Private Vault. Lock anyway and discard them?')
+    ) {
+      return;
+    }
     setDek(null);
     setIndex(null);
+    setPrivateDirty(false);
     showToast('Private Vault locked.');
-  }, [showToast]);
+  }, [privateDirty, showToast]);
 
   // Idle auto-lock timer
   useEffect(() => {
@@ -224,19 +262,20 @@ export function App() {
           </button>
         </nav>
 
-        {/* Main view */}
+        {/* Main view — keep Public/Private mounted so tab switching never loses drafts */}
         <div className="min-h-0 flex-1 overflow-hidden">
-          {tab === 'public' && (
+          <div className={tab === 'public' ? 'h-full' : 'hidden'}>
             <PublicNotesView
               storage={storage}
               hasProviders={hasEnabledProviders}
               onSourceChange={handleSourceChange}
+              onDirtyChange={setPublicDirty}
               onToast={showToast}
               onOpenSettings={() => setTab('settings')}
             />
-          )}
+          </div>
 
-          {tab === 'private' && (
+          <div className={tab === 'private' ? 'h-full' : 'hidden'}>
             <PrivateVaultView
               vaultService={vaultService}
               hasProviders={hasEnabledProviders}
@@ -250,11 +289,12 @@ export function App() {
                 setMeta(next.meta);
                 setIndex(next.index);
               }}
+              onDirtyChange={setPrivateDirty}
               onSourceChange={handleSourceChange}
               onToast={showToast}
               onOpenSettings={() => setTab('settings')}
             />
-          )}
+          </div>
 
           {tab === 'settings' && (
             <SettingsView

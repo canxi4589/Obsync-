@@ -110,13 +110,61 @@ describe('VaultService End-to-End', () => {
       true
     );
 
-    // Delete note
+    // Delete note (creates tombstone instead of erasing history)
     const afterDel = await vaultService.deletePrivateNote(
       recovered.dek,
       imp.index,
       saved.note.id
     );
-    expect(afterDel.index.notes).toHaveLength(1);
+    expect(afterDel.index.notes.filter((n) => !n.deleted)).toHaveLength(1);
+    expect(afterDel.index.notes.find((n) => n.id === saved.note.id)?.deleted).toBe(true);
     expect(backend.files.has(`.obsync-vault/notes/${saved.note.id}.enc`)).toBe(false);
+  });
+
+  it('merges concurrent multi-device index edits and keeps tombstones from resurrecting', async () => {
+    const backend = new MockMemStorage();
+    const manager = new StorageManager([memConfig], new OfflineCache(), () => backend);
+    const vaultService = new VaultService(manager);
+
+    const init = await vaultService.initializeNewVault('SharedPass!');
+    const deviceA = vaultService;
+    const deviceB = new VaultService(
+      new StorageManager([memConfig], new OfflineCache(), () => backend)
+    );
+
+    const unlockedB = await deviceB.unlockVault('SharedPass!', init.meta);
+
+    // Device A saves Note A (remote index updated)
+    const afterA = await deviceA.savePrivateNote(init.dek, init.index, {
+      title: 'From iPhone',
+      folder: '',
+      content: 'iphone content',
+    });
+
+    // Device B still holds its stale initial empty index, and saves Note B
+    const afterB = await deviceB.savePrivateNote(unlockedB.dek, unlockedB.index, {
+      title: 'From Windows',
+      folder: '',
+      content: 'windows content',
+    });
+
+    const activeTitles = afterB.index.notes.filter((n) => !n.deleted).map((n) => n.title);
+    expect(activeTitles).toContain('From iPhone');
+    expect(activeTitles).toContain('From Windows');
+
+    // Wait 2ms so delete timestamp is strictly newer than save timestamp, then Device A deletes Note A
+    await new Promise((r) => setTimeout(r, 5));
+    await deviceA.deletePrivateNote(init.dek, afterA.index, afterA.note.id);
+
+    // Device B (still holding stale afterB.index where Note A was active) saves Note B again: Note A must stay deleted
+    const afterBEdit = await deviceB.savePrivateNote(unlockedB.dek, afterB.index, {
+      id: afterB.note.id,
+      title: 'From Windows Updated',
+      folder: '',
+      content: 'windows v2',
+    });
+    const finalActive = afterBEdit.index.notes.filter((n) => !n.deleted);
+    expect(finalActive).toHaveLength(1);
+    expect(finalActive[0].title).toBe('From Windows Updated');
   });
 });

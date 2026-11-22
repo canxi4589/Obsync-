@@ -146,4 +146,21 @@ public sealed class GitSyncServiceTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(cloneA, ".git", "rebase-merge")));
         Assert.False(Directory.Exists(Path.Combine(cloneA, ".git", "rebase-apply")));
     }
+
+    [Fact]
+    public async Task TwoWaySync_CleanUpToDateRepo_ReturnsUpToDateWithoutChanges()
+    {
+        var (_, cloneA, _) = SetupRepoPair();
+
+        var res = await _syncService.SyncVaultAsync(new VaultEntry
+        {
+            Name = "CleanVault",
+            Path = cloneA
+        });
+
+        Assert.True(res.Success, res.ErrorDetails);
+        Assert.False(res.HadConflict);
+        Assert.False(res.HadChanges);
+        Assert.Equal("Already up to date.", res.Summary);
+    }
 }
