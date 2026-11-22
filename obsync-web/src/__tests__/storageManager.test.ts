@@ -223,4 +223,25 @@ describe('StorageManager Priority, Failover & Mirroring', () => {
     manager.setConfigs([gdWithRoot]);
     expect(factoryCalls).toBe(1);
   });
+
+  it('blocks .git and traversal paths centrally and supports clearing offline files on vault switch', async () => {
+    const p1 = new MemoryMockProvider('p1', 'Primary');
+    const cache = new OfflineCache();
+    const manager = new StorageManager(
+      [makeConfig('p1', 'Primary')],
+      cache,
+      () => p1
+    );
+
+    await expect(manager.write('.git/config', utf8ToBytes('evil'))).rejects.toThrow(
+      'forbidden'
+    );
+    await expect(manager.read('../secret.md')).rejects.toThrow('forbidden');
+    await expect(manager.delete('sub/.git/HEAD')).rejects.toThrow('forbidden');
+
+    await manager.write('note.md', utf8ToBytes('hello'));
+    expect(await cache.listFiles()).toHaveLength(1);
+    await manager.clearOfflineFiles();
+    expect(await cache.listFiles()).toHaveLength(0);
+  });
 });

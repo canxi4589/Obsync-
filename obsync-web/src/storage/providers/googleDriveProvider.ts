@@ -1,4 +1,5 @@
 import { concatBytes, utf8ToBytes } from '../../crypto/base64';
+import { assertSafeStoragePath } from '../pathUtils';
 import {
   AuthExpiredError,
   type FileEntry,
@@ -12,6 +13,7 @@ const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
 const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder';
 const SCOPES =
   'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
+const DRIVE_LIST_CONCURRENCY = 5;
 
 export interface GoogleTokenRecord {
   accessToken: string;
@@ -45,6 +47,12 @@ function getGoogleOAuth2(): GoogleOAuth2Client | undefined {
   return w.google?.accounts?.oauth2;
 }
 
+function createMultipartBoundary(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `obsync_${hex}`;
+}
+
 async function loadGsiScript(): Promise<void> {
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     throw new Error('Google Sign-In requires a browser environment.');
@@ -57,21 +65,44 @@ async function loadGsiScript(): Promise<void> {
       'script[src="https://accounts.google.com/gsi/client"]'
     );
     if (existing) {
-      existing.addEventListener('load', () => resolve(), { once: true });
-      existing.addEventListener(
-        'error',
-        () => reject(new Error('Failed to load Google Identity Services.')),
-        { once: true }
-      );
-      return;
+      if (getGoogleOAuth2() || existing.dataset.obsyncLoaded === 'true') {
+        resolve();
+        return;
+      }
+      if (existing.dataset.obsyncError === 'true') {
+        existing.remove();
+      } else {
+        existing.addEventListener(
+          'load',
+          () => {
+            existing.dataset.obsyncLoaded = 'true';
+            resolve();
+          },
+          { once: true }
+        );
+        existing.addEventListener(
+          'error',
+          () => {
+            existing.dataset.obsyncError = 'true';
+            gsiLoadPromise = null;
+            reject(new Error('Failed to load Google Identity Services.'));
+          },
+          { once: true }
+        );
+        return;
+      }
     }
 
     const script = document.createElement('script');
     script.src = 'https://accounts.google.com/gsi/client';
     script.async = true;
     script.defer = true;
-    script.onload = () => resolve();
+    script.onload = () => {
+      script.dataset.obsyncLoaded = 'true';
+      resolve();
+    };
     script.onerror = () => {
+      script.dataset.obsyncError = 'true';
       gsiLoadPromise = null;
       reject(new Error('Failed to load Google Identity Services script.'));
     };
@@ -215,6 +246,7 @@ export class GoogleDriveProvider implements StorageProvider {
   private getAccessToken(): string {
     const rec = tokenStore.get(this.id);
     if (!rec || Date.now() >= rec.expiresAt - 15_000) {
+      if (rec) tokenStore.delete(this.id);
       throw new AuthExpiredError(
         `Google Drive (${this.config.accountEmail || this.label}) session expired — click Reconnect in Settings.`
       );
@@ -396,42 +428,80 @@ export class GoogleDriveProvider implements StorageProvider {
     }
   }
 
+  private async listFolderChildren(folderId: string): Promise<DriveFileItem[]> {
+    const items: DriveFileItem[] = [];
+    let pageToken: string | undefined;
+
+    do {
+      const q = `'${this.escapeQuery(folderId)}' in parents and trashed = false`;
+      const url = `${DRIVE_API}/files?q=${encodeURIComponent(
+        q
+      )}&fields=${encodeURIComponent(
+        'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum)'
+      )}&pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+
+      const res = await this.authFetch(url);
+      if (!res.ok) {
+        throw new Error(`Google Drive list failed (HTTP ${res.status})`);
+      }
+      const json = (await res.json()) as {
+        nextPageToken?: string;
+        files?: DriveFileItem[];
+      };
+
+      if (json.files) items.push(...json.files);
+      pageToken = json.nextPageToken;
+    } while (pageToken);
+
+    return items;
+  }
+
   async list(prefix = ''): Promise<FileEntry[]> {
-    const rootId = await this.ensureRootFolder(false);
-    if (!rootId) return [];
+    const normPrefix = prefix.replace(/\\/g, '/').replace(/^\/+/, '');
+    let startFolderId: string | null;
+    let startRelPath = '';
 
-    const normPrefix = prefix.replace(/^\/+/, '');
+    // Jump straight to the prefix directory instead of scanning unrelated folders
+    if (normPrefix.includes('/')) {
+      const dirPart = normPrefix.slice(0, normPrefix.lastIndexOf('/'));
+      const segments = dirPart.split('/').filter(Boolean);
+      startFolderId = await this.resolveDir(segments, false);
+      startRelPath = segments.join('/');
+    } else {
+      startFolderId = await this.ensureRootFolder(false);
+    }
+
+    if (!startFolderId) return [];
+
     const entries: FileEntry[] = [];
-    const queue: Array<{ id: string; relPath: string }> = [{ id: rootId, relPath: '' }];
+    const queue: Array<{ id: string; relPath: string }> = [
+      { id: startFolderId, relPath: startRelPath },
+    ];
 
+    // Traverse BFS levels with bounded concurrency
     while (queue.length > 0) {
-      const current = queue.shift()!;
-      let pageToken: string | undefined;
+      const batch = queue.splice(0, DRIVE_LIST_CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(async (dir) => ({
+          dir,
+          items: await this.listFolderChildren(dir.id),
+        }))
+      );
 
-      do {
-        const q = `'${this.escapeQuery(current.id)}' in parents and trashed = false`;
-        const url = `${DRIVE_API}/files?q=${encodeURIComponent(
-          q
-        )}&fields=${encodeURIComponent(
-          'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum)'
-        )}&pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
-
-        const res = await this.authFetch(url);
-        if (!res.ok) {
-          throw new Error(`Google Drive list failed (HTTP ${res.status})`);
-        }
-        const json = (await res.json()) as {
-          nextPageToken?: string;
-          files?: DriveFileItem[];
-        };
-
-        for (const item of json.files ?? []) {
-          if (item.name === '.git') continue;
-          const rel = current.relPath ? `${current.relPath}/${item.name}` : item.name;
+      for (const { dir, items } of batchResults) {
+        for (const item of items) {
+          if (item.name.toLowerCase() === '.git') continue;
+          const rel = dir.relPath ? `${dir.relPath}/${item.name}` : item.name;
 
           if (item.mimeType === DRIVE_FOLDER_MIME) {
             this.folderIdCache.set(rel, item.id);
-            queue.push({ id: item.id, relPath: rel });
+            if (
+              !normPrefix ||
+              rel.startsWith(normPrefix) ||
+              normPrefix.startsWith(`${rel}/`)
+            ) {
+              queue.push({ id: item.id, relPath: rel });
+            }
           } else {
             this.fileIdCache.set(rel, item.id);
             if (!normPrefix || rel.startsWith(normPrefix)) {
@@ -444,16 +514,14 @@ export class GoogleDriveProvider implements StorageProvider {
             }
           }
         }
-
-        pageToken = json.nextPageToken;
-      } while (pageToken);
+      }
     }
 
     return entries;
   }
 
   async read(path: string): Promise<ReadResult | null> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const fileId = await this.resolveFileId(cleanPath);
     if (!fileId) return null;
 
@@ -493,7 +561,7 @@ export class GoogleDriveProvider implements StorageProvider {
     message?: string,
     attempt = 0
   ): Promise<void> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const parts = cleanPath.split('/').filter(Boolean);
     const fileName = parts[parts.length - 1];
     const parentId = await this.resolveDir(parts.slice(0, -1), true);
@@ -508,7 +576,7 @@ export class GoogleDriveProvider implements StorageProvider {
       }
     }
 
-    const boundary = `obsync_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const boundary = createMultipartBoundary();
 
     if (existingId) {
       const body = this.buildMultipartBody({ name: fileName }, data, boundary);
@@ -563,7 +631,7 @@ export class GoogleDriveProvider implements StorageProvider {
   }
 
   async delete(path: string): Promise<void> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const fileId = await this.resolveFileId(cleanPath);
     if (!fileId) return;
 

@@ -1,5 +1,6 @@
-import { toBuffer } from '../../crypto/base64';
+import { asBufferSource } from '../../crypto/base64';
 import type { OfflineCache } from '../offlineCache';
+import { assertSafeStoragePath } from '../pathUtils';
 import {
   AuthExpiredError,
   type FileEntry,
@@ -19,6 +20,8 @@ interface PermissionCapableHandle {
   queryPermission?: (descriptor?: { mode?: 'read' | 'readwrite' }) => Promise<PermissionState>;
   requestPermission?: (descriptor?: { mode?: 'read' | 'readwrite' }) => Promise<PermissionState>;
 }
+
+const STAT_CONCURRENCY = 8;
 
 export class LocalFolderProvider implements StorageProvider {
   readonly id: string;
@@ -118,12 +121,23 @@ export class LocalFolderProvider implements StorageProvider {
   }
 
   private splitPath(path: string): { dirs: string[]; fileName: string } {
-    const segments = path.replace(/^\/+/, '').split('/').filter(Boolean);
+    const safe = assertSafeStoragePath(path);
+    const segments = safe.split('/').filter(Boolean);
     if (segments.length === 0) {
       throw new Error('Invalid empty file path.');
     }
     const fileName = segments[segments.length - 1];
     return { dirs: segments.slice(0, -1), fileName };
+  }
+
+  private canSubdirMatchPrefix(relDirPath: string, filterPrefix: string): boolean {
+    if (!filterPrefix) return true;
+    const dirWithSlash = `${relDirPath}/`;
+    return (
+      dirWithSlash.startsWith(filterPrefix) ||
+      filterPrefix.startsWith(dirWithSlash) ||
+      relDirPath.startsWith(filterPrefix)
+    );
   }
 
   private async walkDir(
@@ -135,29 +149,55 @@ export class LocalFolderProvider implements StorageProvider {
     const iterable = dir as unknown as {
       entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
     };
+
+    const subdirs: Array<{ handle: FileSystemDirectoryHandle; relPath: string }> = [];
+    const matchedFiles: Array<{ handle: FileSystemFileHandle; relPath: string }> = [];
+
     for await (const [name, entry] of iterable.entries()) {
-      if (name === '.git') continue;
+      if (name.toLowerCase() === '.git') continue;
       const relPath = relPrefix ? `${relPrefix}/${name}` : name;
       if (entry.kind === 'directory') {
-        await this.walkDir(entry as FileSystemDirectoryHandle, relPath, filterPrefix, out);
+        if (this.canSubdirMatchPrefix(relPath, filterPrefix)) {
+          subdirs.push({
+            handle: entry as FileSystemDirectoryHandle,
+            relPath,
+          });
+        }
       } else if (entry.kind === 'file') {
         if (!filterPrefix || relPath.startsWith(filterPrefix)) {
-          const fileHandle = entry as FileSystemFileHandle;
-          const file = await fileHandle.getFile();
-          out.push({
-            path: relPath,
-            size: file.size,
-            updatedAt: new Date(file.lastModified).toISOString(),
+          matchedFiles.push({
+            handle: entry as FileSystemFileHandle,
+            relPath,
           });
         }
       }
+    }
+
+    // Batch file metadata lookups concurrently
+    for (let i = 0; i < matchedFiles.length; i += STAT_CONCURRENCY) {
+      const batch = matchedFiles.slice(i, i + STAT_CONCURRENCY);
+      const metas = await Promise.all(
+        batch.map(async ({ handle, relPath }) => {
+          const file = await handle.getFile();
+          return {
+            path: relPath,
+            size: file.size,
+            updatedAt: new Date(file.lastModified).toISOString(),
+          };
+        })
+      );
+      out.push(...metas);
+    }
+
+    for (const sub of subdirs) {
+      await this.walkDir(sub.handle, sub.relPath, filterPrefix, out);
     }
   }
 
   async list(prefix = ''): Promise<FileEntry[]> {
     const root = await this.getRootHandle('read');
     const out: FileEntry[] = [];
-    const normPrefix = prefix.replace(/^\/+/, '');
+    const normPrefix = prefix.replace(/\\/g, '/').replace(/^\/+/, '');
     await this.walkDir(root, '', normPrefix, out);
     return out;
   }
@@ -200,7 +240,7 @@ export class LocalFolderProvider implements StorageProvider {
     const fileHandle = await dir.getFileHandle(fileName, { create: true });
     const writable = await fileHandle.createWritable();
     try {
-      await writable.write(toBuffer(data));
+      await writable.write(asBufferSource(data));
     } finally {
       await writable.close();
     }

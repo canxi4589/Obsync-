@@ -1,11 +1,17 @@
 import {
   AlertTriangle,
   Cloud,
-  Lock,
+  KeyRound,
   LockOpen,
   RefreshCw,
+  Search,
+  Shield,
 } from 'lucide-react';
-import type { ProviderRuntimeStatus, StorageProviderConfig } from '../storage/types';
+import type {
+  CredentialStorageMode,
+  ProviderRuntimeStatus,
+  StorageProviderConfig,
+} from '../storage/types';
 
 interface StorageStatusBarProps {
   configs: StorageProviderConfig[];
@@ -13,10 +19,15 @@ interface StorageStatusBarProps {
   activeSourceLabel: string;
   usedFallback: boolean;
   isVaultUnlocked: boolean;
+  credentialStorage: CredentialStorageMode;
+  credentialsLocked: boolean;
+  hasUnlockedCredentials: boolean;
   onLockVault: () => void;
+  onLockCredentials: () => void;
   onFlushPending: () => Promise<void>;
   isFlushing: boolean;
   onOpenSettings: () => void;
+  onOpenCommandPalette: () => void;
 }
 
 export function StorageStatusBar({
@@ -25,91 +36,147 @@ export function StorageStatusBar({
   activeSourceLabel,
   usedFallback,
   isVaultUnlocked,
+  credentialStorage,
+  credentialsLocked,
+  hasUnlockedCredentials,
   onLockVault,
+  onLockCredentials,
   onFlushPending,
   isFlushing,
   onOpenSettings,
+  onOpenCommandPalette,
 }: StorageStatusBarProps) {
   const totalPending = statuses.reduce((sum, s) => sum + s.pendingOps, 0);
   const enabledCount = configs.filter((c) => c.enabled).length;
   const hasAuthExpired = statuses.some((s) => s.state === 'auth-expired');
+  const hasError = statuses.some((s) => s.state === 'error');
+
+  const dotColor =
+    credentialsLocked || usedFallback
+      ? 'bg-warning'
+      : hasError || hasAuthExpired
+        ? 'bg-error'
+        : 'bg-success';
 
   return (
-    <header className="pt-safe flex items-center justify-between gap-2 border-b border-slate-800 bg-slate-900/90 px-3 py-2 text-xs sm:px-5">
+    <header className="pt-safe sticky top-0 z-30 flex min-h-11 items-center justify-between gap-2 border-b border-base-content/10 bg-base-100 px-3 pb-1.5 text-xs sm:px-5">
+      {/* Left: Active Storage Status */}
       <div className="flex min-w-0 items-center gap-2">
-        <span className="font-bold tracking-tight text-indigo-400 sm:text-sm">
-          Obsync
-        </span>
-
         {enabledCount === 0 ? (
           <button
             type="button"
             onClick={onOpenSettings}
-            className="flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/50 px-2.5 py-0.5 text-amber-300 hover:bg-amber-900/50"
+            className="inline-flex h-7 items-center gap-2 rounded-md border border-base-content/12 bg-base-200/60 px-2.5 text-xs font-medium text-base-content/75 transition hover:border-base-content/22 hover:text-base-content"
+            title="Configure a storage provider"
           >
-            <AlertTriangle className="h-3 w-3" />
-            <span>Add Storage</span>
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" />
+            <span>No storage connected</span>
           </button>
         ) : (
           <button
             type="button"
             onClick={onOpenSettings}
-            className={`flex min-w-0 items-center gap-1.5 rounded-full border px-2.5 py-0.5 transition ${
+            className={`inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition ${
               usedFallback
-                ? 'border-amber-600/60 bg-amber-950/50 text-amber-200'
-                : 'border-slate-700 bg-slate-800/80 text-slate-300 hover:border-slate-600'
+                ? 'border-warning/35 bg-warning/10 text-warning hover:border-warning/50'
+                : 'border-base-content/10 bg-base-200/60 text-base-content/85 hover:border-base-content/20 hover:text-base-content'
             }`}
-            title="Storage status — tap to manage providers & fallbacks"
+            title="Storage status — click to manage providers & fallbacks"
           >
-            <Cloud className="h-3 w-3 shrink-0 text-indigo-400" />
-            <span className="truncate">
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColor}`} />
+            <Cloud className="hidden h-3 w-3 shrink-0 text-base-content/55 sm:inline" />
+            <span className="max-w-[125px] truncate sm:max-w-[220px]">
               {usedFallback ? `Fallback: ${activeSourceLabel}` : activeSourceLabel}
             </span>
           </button>
         )}
 
-        {hasAuthExpired && (
+        {credentialStorage === 'memory' && (
           <button
             type="button"
             onClick={onOpenSettings}
-            className="hidden items-center gap-1 rounded-full bg-rose-950/80 px-2 py-0.5 text-rose-300 sm:flex"
+            title="In-memory only mode: zero data written to localStorage or IndexedDB"
+            className="hidden h-7 items-center gap-1.5 rounded-md border border-info/25 bg-info/10 px-2 text-[11px] font-medium text-info sm:inline-flex"
+          >
+            <Shield className="h-3 w-3" />
+            <span>RAM-only</span>
+          </button>
+        )}
+
+        {credentialsLocked && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 text-xs font-medium text-warning transition hover:border-warning/50"
+          >
+            <KeyRound className="h-3 w-3" />
+            <span className="hidden sm:inline">Unlock Keys</span>
+          </button>
+        )}
+
+        {!credentialsLocked && hasAuthExpired && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="hidden h-7 items-center gap-1.5 rounded-md border border-error/30 bg-error/10 px-2 text-xs font-medium text-error transition hover:border-error/50 sm:inline-flex"
           >
             <AlertTriangle className="h-3 w-3" />
-            <span>Reconnect provider</span>
+            <span>Reconnect</span>
           </button>
         )}
       </div>
 
-      <div className="flex shrink-0 items-center gap-2">
+      {/* Right: Mobile Command Trigger + Active Security / Sync Controls */}
+      <div className="flex shrink-0 items-center gap-1.5">
+        <button
+          type="button"
+          onClick={onOpenCommandPalette}
+          aria-label="Open command palette"
+          title="Command Palette (Ctrl+K)"
+          className="inline-flex h-7 items-center gap-1.5 rounded-md border border-base-content/12 bg-base-200/60 px-2 text-xs text-base-content/70 transition hover:border-base-content/22 hover:text-base-content md:hidden"
+        >
+          <Search className="h-3.5 w-3.5" />
+          <span className="hidden sm:inline">Jump</span>
+        </button>
+
         {totalPending > 0 && (
           <button
             type="button"
             disabled={isFlushing}
             onClick={() => void onFlushPending()}
-            className="flex items-center gap-1 rounded-full border border-indigo-500/50 bg-indigo-950/60 px-2.5 py-0.5 text-indigo-200 hover:bg-indigo-900/60 disabled:opacity-50"
+            className="btn btn-soft btn-primary btn-xs h-7 min-h-0 gap-1.5 rounded-md px-2.5 font-medium tabular-nums"
           >
             <RefreshCw
               className={`h-3 w-3 ${isFlushing ? 'animate-spin' : ''}`}
             />
-            <span>{totalPending} pending</span>
+            <span>{totalPending}</span>
+            <span className="hidden sm:inline">pending</span>
           </button>
         )}
 
-        {isVaultUnlocked ? (
+        {hasUnlockedCredentials && credentialStorage === 'encrypted' && (
+          <button
+            type="button"
+            onClick={onLockCredentials}
+            title="Clear decrypted API tokens from memory"
+            className="hidden h-7 items-center gap-1.5 rounded-md border border-base-content/12 px-2.5 text-xs font-medium text-base-content/75 transition hover:border-base-content/22 hover:bg-base-200 hover:text-base-content sm:inline-flex"
+          >
+            <KeyRound className="h-3 w-3 text-base-content/55" />
+            <span>Lock Keys</span>
+          </button>
+        )}
+
+        {isVaultUnlocked && (
           <button
             type="button"
             onClick={onLockVault}
-            className="flex items-center gap-1 rounded-full border border-emerald-700/60 bg-emerald-950/60 px-2.5 py-0.5 font-medium text-emerald-300 hover:bg-emerald-900/60"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-success/30 bg-success/10 px-2.5 text-xs font-medium text-success transition hover:border-success/50 hover:bg-success/15"
             title="Lock Private Vault now"
           >
             <LockOpen className="h-3 w-3" />
-            <span>Lock Vault</span>
+            <span>Lock</span>
+            <span className="hidden sm:inline">Vault</span>
           </button>
-        ) : (
-          <span className="hidden items-center gap-1 rounded-full border border-slate-800 bg-slate-900 px-2.5 py-0.5 text-slate-500 sm:flex">
-            <Lock className="h-3 w-3" />
-            <span>Locked</span>
-          </span>
         )}
       </div>
     </header>

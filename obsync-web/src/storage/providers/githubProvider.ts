@@ -1,4 +1,5 @@
-import { base64ToBytes, bytesToBase64, utf8ToBytes } from '../../crypto/base64';
+import { base64ToBytes, bytesToBase64 } from '../../crypto/base64';
+import { assertSafeStoragePath } from '../pathUtils';
 import {
   AuthExpiredError,
   type FileEntry,
@@ -27,6 +28,16 @@ export class GitHubProvider implements StorageProvider {
     return `${API_BASE}/repos/${encodeURIComponent(this.config.owner)}/${encodeURIComponent(this.config.repo)}`;
   }
 
+  private requireToken(): string {
+    const token = this.config.token.trim();
+    if (!token) {
+      throw new AuthExpiredError(
+        `GitHub (${this.label}) token missing — edit provider in Settings to re-enter your PAT.`
+      );
+    }
+    return token;
+  }
+
   private encodePath(path: string): string {
     return path
       .replace(/^\/+/, '')
@@ -38,7 +49,7 @@ export class GitHubProvider implements StorageProvider {
 
   private headers(extra?: Record<string, string>): HeadersInit {
     return {
-      Authorization: `Bearer ${this.config.token}`,
+      Authorization: `Bearer ${this.requireToken()}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
       ...extra,
@@ -98,6 +109,60 @@ export class GitHubProvider implements StorageProvider {
     };
   }
 
+  private async walkContentsFallback(
+    startDir: string,
+    normPrefix: string
+  ): Promise<FileEntry[]> {
+    const branch = encodeURIComponent(this.config.branch || 'main');
+    const entries: FileEntry[] = [];
+    const queue: string[] = [startDir];
+
+    while (queue.length > 0) {
+      const batch = queue.splice(0, 4);
+      const results = await Promise.all(
+        batch.map(async (dir) => {
+          const pathSegment = dir ? `/${this.encodePath(dir)}` : '';
+          const url = `${this.repoBase}/contents${pathSegment}?ref=${branch}`;
+          const res = await fetch(url, { headers: this.headers(), cache: 'no-store' });
+          if (res.status === 404) return [];
+          if (!res.ok) {
+            await this.handleError(res, `GitHub list failed (${dir || '/'})`);
+          }
+          const json = (await res.json()) as
+            | Array<{ path: string; type: string; sha: string; size?: number }>
+            | { path: string; type: string; sha: string; size?: number };
+          return Array.isArray(json) ? json : [json];
+        })
+      );
+
+      for (const items of results) {
+        for (const item of items) {
+          if (item.type === 'dir') {
+            if (item.path === '.git' || item.path.startsWith('.git/')) continue;
+            if (
+              !normPrefix ||
+              item.path.startsWith(normPrefix) ||
+              normPrefix.startsWith(`${item.path}/`)
+            ) {
+              queue.push(item.path);
+            }
+          } else if (item.type === 'file') {
+            this.shaCache.set(item.path, item.sha);
+            if (!normPrefix || item.path.startsWith(normPrefix)) {
+              entries.push({
+                path: item.path,
+                size: item.size,
+                etag: item.sha,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return entries;
+  }
+
   async list(prefix = ''): Promise<FileEntry[]> {
     const branch = encodeURIComponent(this.config.branch || 'main');
     const url = `${this.repoBase}/git/trees/${branch}?recursive=1`;
@@ -112,9 +177,15 @@ export class GitHubProvider implements StorageProvider {
     }
     if (res.status === 404) {
       // Distinguish a genuinely empty repository from a missing/misspelled branch name
-      const repoRes = await fetch(this.repoBase, { headers: this.headers(), cache: 'no-store' });
+      const repoRes = await fetch(this.repoBase, {
+        headers: this.headers(),
+        cache: 'no-store',
+      });
       if (repoRes.ok) {
-        const repoJson = (await repoRes.json()) as { size?: number; default_branch?: string };
+        const repoJson = (await repoRes.json()) as {
+          size?: number;
+          default_branch?: string;
+        };
         if ((repoJson.size ?? 0) === 0) {
           return [];
         }
@@ -129,12 +200,19 @@ export class GitHubProvider implements StorageProvider {
     }
 
     const data = (await res.json()) as {
+      truncated?: boolean;
       tree?: Array<{ path: string; type: string; sha: string; size?: number }>;
     };
 
-    const normPrefix = prefix.replace(/^\/+/, '');
-    const entries: FileEntry[] = [];
+    const normPrefix = prefix.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (data.truncated) {
+      const startDir = normPrefix.includes('/')
+        ? normPrefix.slice(0, normPrefix.lastIndexOf('/'))
+        : '';
+      return this.walkContentsFallback(startDir, normPrefix);
+    }
 
+    const entries: FileEntry[] = [];
     for (const item of data.tree ?? []) {
       if (item.type !== 'blob') continue;
       if (normPrefix && !item.path.startsWith(normPrefix)) continue;
@@ -150,7 +228,7 @@ export class GitHubProvider implements StorageProvider {
   }
 
   async read(path: string): Promise<ReadResult | null> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const branch = encodeURIComponent(this.config.branch || 'main');
     const url = `${this.repoBase}/contents/${this.encodePath(cleanPath)}?ref=${branch}`;
     const res = await fetch(url, {
@@ -200,8 +278,43 @@ export class GitHubProvider implements StorageProvider {
     return { data: new Uint8Array(0), etag: json.sha };
   }
 
+  /**
+   * Resolves a file's SHA by listing its parent directory first (metadata only,
+   * no base64 body download, and warms shaCache for siblings), falling back to
+   * direct file metadata lookup if needed.
+   */
   private async fetchCurrentSha(cleanPath: string): Promise<string | undefined> {
     const branch = encodeURIComponent(this.config.branch || 'main');
+    const slashIdx = cleanPath.lastIndexOf('/');
+    const parentDir = slashIdx > 0 ? cleanPath.slice(0, slashIdx) : '';
+    const parentUrl = `${this.repoBase}/contents${
+      parentDir ? `/${this.encodePath(parentDir)}` : ''
+    }?ref=${branch}`;
+
+    const dirRes = await fetch(parentUrl, {
+      headers: this.headers(),
+      cache: 'no-store',
+    });
+
+    if (dirRes.ok) {
+      const json = (await dirRes.json()) as unknown;
+      if (Array.isArray(json)) {
+        let foundSha: string | undefined;
+        for (const item of json as Array<{ path?: string; sha?: string; type?: string }>) {
+          if (item.type === 'file' && item.path && item.sha) {
+            this.shaCache.set(item.path, item.sha);
+            if (item.path === cleanPath) foundSha = item.sha;
+          }
+        }
+        if (!foundSha) this.shaCache.delete(cleanPath);
+        return foundSha;
+      }
+    } else if (dirRes.status === 404) {
+      this.shaCache.delete(cleanPath);
+      return undefined;
+    }
+
+    // Fallback: direct contents lookup
     const url = `${this.repoBase}/contents/${this.encodePath(cleanPath)}?ref=${branch}`;
     const res = await fetch(url, { headers: this.headers(), cache: 'no-store' });
     if (res.status === 404) {
@@ -219,7 +332,7 @@ export class GitHubProvider implements StorageProvider {
   }
 
   async write(path: string, data: Uint8Array, message?: string): Promise<void> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const commitMsg = message || `obsync: update ${cleanPath}`;
     const contentB64 = bytesToBase64(data);
 
@@ -239,7 +352,7 @@ export class GitHubProvider implements StorageProvider {
       return fetch(`${this.repoBase}/contents/${this.encodePath(cleanPath)}`, {
         method: 'PUT',
         headers: this.headers({ 'Content-Type': 'application/json' }),
-        body: utf8ToBytes(JSON.stringify(body)),
+        body: JSON.stringify(body),
       });
     };
 
@@ -261,8 +374,9 @@ export class GitHubProvider implements StorageProvider {
   }
 
   async delete(path: string, message?: string): Promise<void> {
-    const cleanPath = path.replace(/^\/+/, '');
-    const sha = this.shaCache.get(cleanPath) ?? (await this.fetchCurrentSha(cleanPath));
+    const cleanPath = assertSafeStoragePath(path);
+    const sha =
+      this.shaCache.get(cleanPath) ?? (await this.fetchCurrentSha(cleanPath));
     if (!sha) return; // already absent
 
     const commitMsg = message || `obsync: delete ${cleanPath}`;

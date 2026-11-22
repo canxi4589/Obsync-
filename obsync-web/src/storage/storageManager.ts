@@ -1,5 +1,6 @@
 import { toBuffer } from '../crypto/base64';
 import { OfflineCache } from './offlineCache';
+import { assertSafeStoragePath } from './pathUtils';
 import { GitHubProvider } from './providers/githubProvider';
 import { GoogleDriveProvider } from './providers/googleDriveProvider';
 import { LocalFolderProvider } from './providers/localFolderProvider';
@@ -157,40 +158,50 @@ export class StorageManager {
     );
   }
 
+  async clearOfflineFiles(): Promise<void> {
+    await this.cache.clearFiles();
+  }
+
   async refreshPendingCounts(): Promise<number> {
-    const ops = await this.cache.getPendingOps();
-    const counts = new Map<string, number>();
-    for (const op of ops) {
-      counts.set(op.providerId, (counts.get(op.providerId) ?? 0) + 1);
-    }
+    const { counts, total } = await this.cache.getPendingCountsByProvider();
+    let changed = false;
     for (const entry of this.entries) {
+      const nextCount = counts.get(entry.config.id) ?? 0;
       const existing = this.statuses.get(entry.config.id) ?? {
         providerId: entry.config.id,
         state: 'idle' as ProviderHealthState,
         pendingOps: 0,
       };
-      this.statuses.set(entry.config.id, {
-        ...existing,
-        pendingOps: counts.get(entry.config.id) ?? 0,
-      });
+      if (existing.pendingOps !== nextCount) {
+        changed = true;
+        this.statuses.set(entry.config.id, {
+          ...existing,
+          pendingOps: nextCount,
+        });
+      }
     }
-    this.notify();
-    return ops.length;
+    if (changed) {
+      this.notify();
+    }
+    return total;
   }
 
   private markSuccess(providerId: string): void {
     const prev = this.statuses.get(providerId) ?? {
       providerId,
-      state: 'ok' as ProviderHealthState,
+      state: 'idle' as ProviderHealthState,
       pendingOps: 0,
     };
+    const visibleChanged = prev.state !== 'ok' || prev.lastError !== undefined;
     this.statuses.set(providerId, {
       ...prev,
       state: 'ok',
       lastSuccessAt: new Date().toISOString(),
       lastError: undefined,
     });
-    this.notify();
+    if (visibleChanged) {
+      this.notify();
+    }
   }
 
   private markError(providerId: string, err: unknown): string {
@@ -199,15 +210,18 @@ export class StorageManager {
       err instanceof AuthExpiredError ? 'auth-expired' : 'error';
     const prev = this.statuses.get(providerId) ?? {
       providerId,
-      state,
+      state: 'idle' as ProviderHealthState,
       pendingOps: 0,
     };
+    const visibleChanged = prev.state !== state || prev.lastError !== message;
     this.statuses.set(providerId, {
       ...prev,
       state,
       lastError: message,
     });
-    this.notify();
+    if (visibleChanged) {
+      this.notify();
+    }
     return message;
   }
 
@@ -271,7 +285,7 @@ export class StorageManager {
   }
 
   async read(path: string): Promise<ManagedReadResult> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const enabled = this.getEnabledEntries();
     if (enabled.length === 0) {
       const cached = await this.cache.getFile(cleanPath);
@@ -286,10 +300,7 @@ export class StorageManager {
     }
 
     const warnings: string[] = [];
-    const pendingAll = await this.cache.getPendingOps();
-    const pendingSet = new Set(
-      pendingAll.filter((o) => o.path === cleanPath).map((o) => o.providerId)
-    );
+    const pendingSet = await this.cache.getPendingProviderIdsForPath(cleanPath);
 
     for (let i = 0; i < enabled.length; i++) {
       const { config, provider } = enabled[i];
@@ -342,7 +353,7 @@ export class StorageManager {
   }
 
   async write(path: string, data: Uint8Array, message?: string): Promise<MirrorSummary> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     const payload = toBuffer(data);
     await this.cache.putFile(cleanPath, payload);
 
@@ -352,28 +363,21 @@ export class StorageManager {
     }
 
     let primaryWritten: ManagedEntry | null = null;
-    let primaryUsedFallback = false;
+    let primaryIndex = -1;
     const mirroredTo: string[] = [];
     const queuedFor: MirrorSummary['queuedFor'] = [];
 
+    // Phase 1: failover sequentially until a primary target succeeds
     for (let i = 0; i < enabled.length; i++) {
       const entry = enabled[i];
       const { config, provider } = entry;
-
-      const shouldAttempt = primaryWritten === null || config.mirrorWrites;
-      if (!shouldAttempt) continue;
-
       try {
         await provider.write(cleanPath, payload, message);
         this.markSuccess(provider.id);
         await this.cache.removeMirrorOp(`${provider.id}::${cleanPath}`);
-
-        if (primaryWritten === null) {
-          primaryWritten = entry;
-          primaryUsedFallback = i > 0;
-        } else {
-          mirroredTo.push(config.label);
-        }
+        primaryWritten = entry;
+        primaryIndex = i;
+        break;
       } catch (err) {
         const reason = this.markError(provider.id, err);
         await this.cache.enqueueMirrorOp({
@@ -390,6 +394,37 @@ export class StorageManager {
       }
     }
 
+    // Phase 2: mirror concurrently to all remaining fallback providers with mirrorWrites enabled
+    if (primaryWritten !== null) {
+      const mirrorTargets = enabled
+        .slice(primaryIndex + 1)
+        .filter((e) => e.config.mirrorWrites);
+
+      await Promise.allSettled(
+        mirrorTargets.map(async ({ config, provider }) => {
+          try {
+            await provider.write(cleanPath, payload, message);
+            this.markSuccess(provider.id);
+            await this.cache.removeMirrorOp(`${provider.id}::${cleanPath}`);
+            mirroredTo.push(config.label);
+          } catch (err) {
+            const reason = this.markError(provider.id, err);
+            await this.cache.enqueueMirrorOp({
+              id: `${provider.id}::${cleanPath}`,
+              providerId: provider.id,
+              op: 'write',
+              path: cleanPath,
+              data: payload,
+              message,
+              createdAt: new Date().toISOString(),
+              lastError: reason,
+            });
+            queuedFor.push({ providerId: provider.id, label: config.label, reason });
+          }
+        })
+      );
+    }
+
     await this.refreshPendingCounts();
 
     if (primaryWritten === null) {
@@ -402,14 +437,14 @@ export class StorageManager {
     return {
       primaryWrittenProviderId: primaryWritten.provider.id,
       primaryWrittenLabel: primaryWritten.config.label,
-      usedFallback: primaryUsedFallback,
+      usedFallback: primaryIndex > 0,
       mirroredTo,
       queuedFor,
     };
   }
 
   async delete(path: string, message?: string): Promise<MirrorSummary> {
-    const cleanPath = path.replace(/^\/+/, '');
+    const cleanPath = assertSafeStoragePath(path);
     await this.cache.deleteFile(cleanPath);
 
     const enabled = this.getEnabledEntries();
@@ -418,27 +453,20 @@ export class StorageManager {
     }
 
     let primaryWritten: ManagedEntry | null = null;
-    let primaryUsedFallback = false;
+    let primaryIndex = -1;
     const mirroredTo: string[] = [];
     const queuedFor: MirrorSummary['queuedFor'] = [];
 
     for (let i = 0; i < enabled.length; i++) {
       const entry = enabled[i];
       const { config, provider } = entry;
-      const shouldAttempt = primaryWritten === null || config.mirrorWrites;
-      if (!shouldAttempt) continue;
-
       try {
         await provider.delete(cleanPath, message);
         this.markSuccess(provider.id);
         await this.cache.removeMirrorOp(`${provider.id}::${cleanPath}`);
-
-        if (primaryWritten === null) {
-          primaryWritten = entry;
-          primaryUsedFallback = i > 0;
-        } else {
-          mirroredTo.push(config.label);
-        }
+        primaryWritten = entry;
+        primaryIndex = i;
+        break;
       } catch (err) {
         const reason = this.markError(provider.id, err);
         await this.cache.enqueueMirrorOp({
@@ -454,6 +482,35 @@ export class StorageManager {
       }
     }
 
+    if (primaryWritten !== null) {
+      const mirrorTargets = enabled
+        .slice(primaryIndex + 1)
+        .filter((e) => e.config.mirrorWrites);
+
+      await Promise.allSettled(
+        mirrorTargets.map(async ({ config, provider }) => {
+          try {
+            await provider.delete(cleanPath, message);
+            this.markSuccess(provider.id);
+            await this.cache.removeMirrorOp(`${provider.id}::${cleanPath}`);
+            mirroredTo.push(config.label);
+          } catch (err) {
+            const reason = this.markError(provider.id, err);
+            await this.cache.enqueueMirrorOp({
+              id: `${provider.id}::${cleanPath}`,
+              providerId: provider.id,
+              op: 'delete',
+              path: cleanPath,
+              message,
+              createdAt: new Date().toISOString(),
+              lastError: reason,
+            });
+            queuedFor.push({ providerId: provider.id, label: config.label, reason });
+          }
+        })
+      );
+    }
+
     await this.refreshPendingCounts();
 
     if (primaryWritten === null) {
@@ -466,7 +523,7 @@ export class StorageManager {
     return {
       primaryWrittenProviderId: primaryWritten.provider.id,
       primaryWrittenLabel: primaryWritten.config.label,
-      usedFallback: primaryUsedFallback,
+      usedFallback: primaryIndex > 0,
       mirroredTo,
       queuedFor,
     };
@@ -484,22 +541,22 @@ export class StorageManager {
     for (const op of ops) {
       const entry = this.entries.find((e) => e.config.id === op.providerId);
       if (!entry || !entry.config.enabled) {
-        // Provider removed or disabled; drop stale op if removed
         if (!entry) await this.cache.removeMirrorOp(op.id);
         continue;
       }
 
       try {
+        const cleanPath = assertSafeStoragePath(op.path);
         if (op.op === 'write') {
           const data =
-            op.data ?? (await this.cache.getFile(op.path))?.data;
+            op.data ?? (await this.cache.getFile(cleanPath))?.data;
           if (!data) {
             await this.cache.removeMirrorOp(op.id);
             continue;
           }
-          await entry.provider.write(op.path, data, op.message);
+          await entry.provider.write(cleanPath, data, op.message);
         } else {
-          await entry.provider.delete(op.path, op.message);
+          await entry.provider.delete(cleanPath, op.message);
         }
 
         await this.cache.removeMirrorOp(op.id);
@@ -527,26 +584,50 @@ export class StorageManager {
       throw new Error('Source or target provider not found.');
     }
 
-    const files = (await source.list('')).filter((f) => !f.path.startsWith('.git/'));
+    const files = (await source.list('')).filter((f) => {
+      try {
+        assertSafeStoragePath(f.path);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
     let copied = 0;
     let failed = 0;
+    let done = 0;
     const errors: string[] = [];
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      onProgress?.(i, files.length, file.path);
-      try {
-        const readRes = await source.read(file.path);
-        if (!readRes) continue;
-        await target.write(file.path, readRes.data, `Mirror ${file.path}`);
-        await this.cache.removeMirrorOp(`${target.id}::${file.path}`);
-        copied++;
-      } catch (err) {
-        failed++;
-        const msg = this.markError(target.id, err);
-        errors.push(`${file.path}: ${msg}`);
+    // GitHub Contents API updates a single branch ref per commit, so serialize writes to GitHub
+    const concurrency = target.type === 'github' ? 1 : 4;
+    let cursor = 0;
+
+    const worker = async (): Promise<void> => {
+      while (cursor < files.length) {
+        const idx = cursor++;
+        const file = files[idx];
+        onProgress?.(done, files.length, file.path);
+        try {
+          const readRes = await source.read(file.path);
+          if (!readRes) {
+            done++;
+            continue;
+          }
+          await target.write(file.path, readRes.data, `Mirror ${file.path}`);
+          await this.cache.removeMirrorOp(`${target.id}::${file.path}`);
+          copied++;
+        } catch (err) {
+          failed++;
+          const msg = this.markError(target.id, err);
+          errors.push(`${file.path}: ${msg}`);
+        } finally {
+          done++;
+        }
       }
-    }
+    };
+
+    const workerCount = Math.min(concurrency, Math.max(1, files.length));
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     if (failed === 0) this.markSuccess(target.id);
     await this.refreshPendingCounts();

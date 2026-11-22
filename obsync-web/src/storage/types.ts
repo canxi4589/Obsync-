@@ -121,7 +121,13 @@ export interface MirrorSummary {
   queuedFor: { providerId: string; label: string; reason: string }[];
 }
 
+export type CredentialStorageMode = 'encrypted' | 'memory';
+
+export type ObsyncTheme = 'obsync' | 'night' | 'dracula' | 'dim' | 'nord' | 'light';
+
 export interface AppPreferences {
   autoLockMinutes: number;
   defaultGoogleClientId?: string;
+  credentialStorage: CredentialStorageMode;
+  theme?: ObsyncTheme;
 }

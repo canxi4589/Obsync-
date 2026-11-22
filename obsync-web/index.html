@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en" class="dark" data-theme="obsync">
   <head>
     <meta charset="UTF-8" />
     <meta
@@ -12,10 +12,10 @@
       content="black-translucent"
     />
     <meta name="apple-mobile-web-app-title" content="Obsync" />
-    <meta name="theme-color" content="#0f172a" />
+    <meta name="theme-color" content="#0d0d0e" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://accounts.google.com; img-src 'self' data: blob: https:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; frame-src https://accounts.google.com; object-src 'none'; base-uri 'self';"
+      content="default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://accounts.google.com; img-src 'self' data: blob: https:; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; frame-src https://accounts.google.com; object-src 'none'; base-uri 'self'; form-action 'none';"
     />
     <meta
       name="description"
@@ -26,7 +26,7 @@
     <link rel="icon" type="image/svg+xml" href="./icon.svg" />
     <title>Obsync — Encrypted Notes</title>
   </head>
-  <body class="bg-slate-950 text-slate-100 antialiased selection:bg-indigo-500/30">
+  <body class="bg-base-100 text-base-content antialiased selection:bg-primary/30 selection:text-primary-content">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

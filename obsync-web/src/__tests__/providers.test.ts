@@ -8,6 +8,8 @@ import {
   setGoogleDriveToken,
 } from '../storage/providers/googleDriveProvider';
 import {
+  assertValidS3Endpoint,
+  decodeXmlEntities,
   parseListObjectsV2Xml,
   signAwsV4Headers,
 } from '../storage/providers/s3Provider';
@@ -344,5 +346,21 @@ describe('Providers', () => {
 
     await expect(gdRetry.write('x.enc', new Uint8Array([9]))).rejects.toThrow('after retry');
     expect(patchAttempts).toBe(2);
+  });
+
+  it('prevents XML double-unescaping, ReDoS on unclosed tags, and insecure S3 endpoints', () => {
+    expect(decodeXmlEntities('A &amp;lt; B &amp; C &#x27;D&#39;')).toBe("A &lt; B & C 'D'");
+
+    // Linear parsing handles thousands of unclosed <Contents> tags instantaneously
+    const malformed = '<Contents>'.repeat(5000) + '<Key>x</Key>';
+    const start = Date.now();
+    const parsed = parseListObjectsV2Xml(malformed);
+    expect(parsed.items).toHaveLength(0);
+    expect(Date.now() - start).toBeLessThan(200);
+
+    expect(() => assertValidS3Endpoint('https://acct.r2.cloudflarestorage.com')).not.toThrow();
+    expect(() => assertValidS3Endpoint('http://localhost:9000')).not.toThrow();
+    expect(() => assertValidS3Endpoint('http://127.0.0.1:9000')).not.toThrow();
+    expect(() => assertValidS3Endpoint('http://evil.example.com')).toThrow('HTTPS');
   });
 });

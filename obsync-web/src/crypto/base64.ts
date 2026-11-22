@@ -2,8 +2,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 export function utf8ToBytes(text: string): Uint8Array<ArrayBuffer> {
-  const encoded = encoder.encode(text);
-  return new Uint8Array(encoded);
+  return encoder.encode(text) as Uint8Array<ArrayBuffer>;
 }
 
 export function bytesToUtf8(bytes: Uint8Array): string {
@@ -45,4 +44,15 @@ export function toBuffer(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy;
+}
+
+/**
+ * Returns a Web Crypto compatible Uint8Array<ArrayBuffer> without copying when
+ * the input is already backed by a standard ArrayBuffer.
+ */
+export function asBufferSource(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (bytes.buffer instanceof ArrayBuffer) {
+    return bytes as Uint8Array<ArrayBuffer>;
+  }
+  return toBuffer(bytes);
 }

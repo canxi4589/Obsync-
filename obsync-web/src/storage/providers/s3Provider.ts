@@ -1,4 +1,5 @@
-import { toBuffer, utf8ToBytes } from '../../crypto/base64';
+import { asBufferSource, utf8ToBytes } from '../../crypto/base64';
+import { assertSafeStoragePath } from '../pathUtils';
 import {
   AuthExpiredError,
   type FileEntry,
@@ -7,28 +8,78 @@ import {
   type StorageProvider,
 } from '../types';
 
+const SIGNING_KEY_CACHE_MAX = 8;
+const signingKeyCache = new Map<string, CryptoKey>();
+
 function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', toBuffer(data));
+  const digest = await crypto.subtle.digest('SHA-256', asBufferSource(data));
   return toHex(new Uint8Array(digest));
 }
 
-async function hmacSha256(
+async function hmacSha256Raw(
   key: Uint8Array,
   message: string
 ): Promise<Uint8Array<ArrayBuffer>> {
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
-    toBuffer(key),
+    asBufferSource(key),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']
   );
   const sig = await crypto.subtle.sign('HMAC', cryptoKey, utf8ToBytes(message));
   return new Uint8Array(sig);
+}
+
+async function getSigningCryptoKey(
+  secretAccessKey: string,
+  dateStamp: string,
+  region: string
+): Promise<CryptoKey> {
+  // Key cache by HMAC of secret + scope (never stores plaintext secret as map key)
+  const keyTag = await sha256Hex(
+    utf8ToBytes(`${dateStamp}|${region}|${secretAccessKey}`)
+  );
+  const cached = signingKeyCache.get(keyTag);
+  if (cached) return cached;
+
+  const secretBytes = utf8ToBytes(`AWS4${secretAccessKey}`);
+  let kDate: Uint8Array<ArrayBuffer> | undefined;
+  let kRegion: Uint8Array<ArrayBuffer> | undefined;
+  let kService: Uint8Array<ArrayBuffer> | undefined;
+  let kSigning: Uint8Array<ArrayBuffer> | undefined;
+
+  try {
+    kDate = await hmacSha256Raw(secretBytes, dateStamp);
+    kRegion = await hmacSha256Raw(kDate, region);
+    kService = await hmacSha256Raw(kRegion, 's3');
+    kSigning = await hmacSha256Raw(kService, 'aws4_request');
+
+    const signingKey = await crypto.subtle.importKey(
+      'raw',
+      kSigning,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    if (signingKeyCache.size >= SIGNING_KEY_CACHE_MAX) {
+      const oldest = signingKeyCache.keys().next().value;
+      if (oldest) signingKeyCache.delete(oldest);
+    }
+    signingKeyCache.set(keyTag, signingKey);
+    return signingKey;
+  } finally {
+    secretBytes.fill(0);
+    kDate?.fill(0);
+    kRegion?.fill(0);
+    kService?.fill(0);
+    kSigning?.fill(0);
+  }
 }
 
 function encodeRfc3986(str: string): string {
@@ -56,6 +107,25 @@ function canonicalizeEncodedPathname(pathname: string): string {
       }
     })
     .join('/');
+}
+
+export function assertValidS3Endpoint(endpoint: string): URL {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new Error('Invalid S3/R2 endpoint URL.');
+  }
+  const isLocal =
+    url.hostname === 'localhost' ||
+    url.hostname === '127.0.0.1' ||
+    url.hostname === '[::1]';
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLocal)) {
+    throw new Error(
+      'S3/R2 endpoint must use HTTPS (plain HTTP is allowed only for localhost).'
+    );
+  }
+  return url;
 }
 
 export async function signAwsV4Headers(params: {
@@ -110,14 +180,17 @@ export async function signAwsV4Headers(params: {
   const scope = `${dateStamp}/${params.region}/s3/aws4_request`;
   const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, reqHash].join('\n');
 
-  const kDate = await hmacSha256(
-    utf8ToBytes(`AWS4${params.secretAccessKey}`),
-    dateStamp
+  const signingKey = await getSigningCryptoKey(
+    params.secretAccessKey,
+    dateStamp,
+    params.region
   );
-  const kRegion = await hmacSha256(kDate, params.region);
-  const kService = await hmacSha256(kRegion, 's3');
-  const kSigning = await hmacSha256(kService, 'aws4_request');
-  const signature = toHex(await hmacSha256(kSigning, stringToSign));
+  const sigBuf = await crypto.subtle.sign(
+    'HMAC',
+    signingKey,
+    utf8ToBytes(stringToSign)
+  );
+  const signature = toHex(new Uint8Array(sigBuf));
 
   const authorization = `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
@@ -128,18 +201,57 @@ export async function signAwsV4Headers(params: {
   };
 }
 
-function decodeXmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+/**
+ * Single-pass XML entity decoder (prevents `&amp;lt;` double-unescaping bugs
+ * and supports numeric character references used by S3).
+ */
+export function decodeXmlEntities(text: string): string {
+  return text.replace(
+    /&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g,
+    (full, entity: string) => {
+      switch (entity) {
+        case 'amp':
+          return '&';
+        case 'lt':
+          return '<';
+        case 'gt':
+          return '>';
+        case 'quot':
+          return '"';
+        case 'apos':
+          return "'";
+        default: {
+          if (entity.startsWith('#x')) {
+            const code = Number.parseInt(entity.slice(2), 16);
+            return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+              ? String.fromCodePoint(code)
+              : full;
+          }
+          if (entity.startsWith('#')) {
+            const code = Number.parseInt(entity.slice(1), 10);
+            return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+              ? String.fromCodePoint(code)
+              : full;
+          }
+          return full;
+        }
+      }
+    }
+  );
 }
 
-function extractXmlTag(block: string, tag: string): string | undefined {
-  const match = block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
-  return match ? decodeXmlEntities(match[1]) : undefined;
+/**
+ * Linear O(n) XML tag extractor (immune to quadratic regex backtracking).
+ */
+function extractXmlTagLinear(block: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const start = block.indexOf(open);
+  if (start === -1) return undefined;
+  const contentStart = start + open.length;
+  const end = block.indexOf(close, contentStart);
+  if (end === -1) return undefined;
+  return decodeXmlEntities(block.slice(contentStart, end));
 }
 
 export function parseListObjectsV2Xml(xml: string): {
@@ -147,15 +259,25 @@ export function parseListObjectsV2Xml(xml: string): {
   nextToken?: string;
 } {
   const items: Array<{ key: string; size?: number; etag?: string; updatedAt?: string }> = [];
-  const contentsRegex = /<Contents>([\s\S]*?)<\/Contents>/g;
-  let m: RegExpExecArray | null;
-  while ((m = contentsRegex.exec(xml)) !== null) {
-    const block = m[1];
-    const key = extractXmlTag(block, 'Key');
+  const openTag = '<Contents>';
+  const closeTag = '</Contents>';
+
+  let pos = 0;
+  while (pos < xml.length) {
+    const start = xml.indexOf(openTag, pos);
+    if (start === -1) break;
+    const contentStart = start + openTag.length;
+    const end = xml.indexOf(closeTag, contentStart);
+    if (end === -1) break;
+
+    const block = xml.slice(contentStart, end);
+    pos = end + closeTag.length;
+
+    const key = extractXmlTagLinear(block, 'Key');
     if (!key) continue;
-    const sizeStr = extractXmlTag(block, 'Size');
-    const etag = extractXmlTag(block, 'ETag')?.replace(/^"|"$/g, '');
-    const updatedAt = extractXmlTag(block, 'LastModified');
+    const sizeStr = extractXmlTagLinear(block, 'Size');
+    const etag = extractXmlTagLinear(block, 'ETag')?.replace(/^"|"$/g, '');
+    const updatedAt = extractXmlTagLinear(block, 'LastModified');
     items.push({
       key,
       size: sizeStr ? Number(sizeStr) : undefined,
@@ -164,9 +286,9 @@ export function parseListObjectsV2Xml(xml: string): {
     });
   }
 
-  const isTruncated = extractXmlTag(xml, 'IsTruncated') === 'true';
+  const isTruncated = extractXmlTagLinear(xml, 'IsTruncated') === 'true';
   const nextToken = isTruncated
-    ? extractXmlTag(xml, 'NextContinuationToken')
+    ? extractXmlTagLinear(xml, 'NextContinuationToken')
     : undefined;
 
   return { items, nextToken };
@@ -186,11 +308,14 @@ export class S3Provider implements StorageProvider {
   }
 
   private get basePrefix(): string {
-    return (this.config.prefix ?? '').replace(/^\/+|\/+$/g, '');
+    return (this.config.prefix ?? '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
   }
 
-  private buildFullKey(path: string): string {
-    const clean = path.replace(/^\/+/, '');
+  private buildFullKey(path: string, allowEmpty = false): string {
+    const clean = allowEmpty
+      ? path.replace(/\\/g, '/').replace(/^\/+/, '')
+      : assertSafeStoragePath(path);
+    if (!clean) return this.basePrefix;
     return this.basePrefix ? `${this.basePrefix}/${clean}` : clean;
   }
 
@@ -202,6 +327,7 @@ export class S3Provider implements StorageProvider {
 
   private buildObjectUrl(key?: string, query?: Record<string, string>): URL {
     const endpoint = this.config.endpoint.replace(/\/+$/, '');
+    assertValidS3Endpoint(endpoint);
     const bucket = encodeRfc3986(this.config.bucket);
     const keyPart = key ? `/${encodePathSegments(key)}` : '';
     const url = new URL(`${endpoint}/${bucket}${keyPart}`);
@@ -218,6 +344,12 @@ export class S3Provider implements StorageProvider {
     url: URL,
     payload: Uint8Array = new Uint8Array(0)
   ): Promise<Response> {
+    if (!this.config.accessKeyId.trim() || !this.config.secretAccessKey.trim()) {
+      throw new AuthExpiredError(
+        `S3/R2 (${this.label}) credentials missing — edit provider in Settings to re-enter your Secret Access Key.`
+      );
+    }
+
     const headers = await signAwsV4Headers({
       method,
       url,
@@ -230,7 +362,7 @@ export class S3Provider implements StorageProvider {
     const res = await fetch(url.toString(), {
       method,
       headers,
-      body: method === 'PUT' ? toBuffer(payload) : undefined,
+      body: method === 'PUT' ? asBufferSource(payload) : undefined,
       cache: 'no-store',
     });
 
@@ -263,8 +395,7 @@ export class S3Provider implements StorageProvider {
   }
 
   async list(prefix = ''): Promise<FileEntry[]> {
-    const normPrefix = prefix.replace(/^\/+/, '');
-    const fullPrefix = this.buildFullKey(normPrefix);
+    const fullPrefix = this.buildFullKey(prefix, true);
     const entries: FileEntry[] = [];
     let continuationToken: string | undefined;
 

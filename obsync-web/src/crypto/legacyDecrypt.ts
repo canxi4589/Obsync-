@@ -1,4 +1,4 @@
-import { concatBytes, toBuffer, utf8ToBytes } from './base64';
+import { asBufferSource, concatBytes, utf8ToBytes } from './base64';
 import { WrongSecretError } from './vaultCrypto';
 
 const LEGACY_SALT_SIZE = 16;
@@ -20,8 +20,8 @@ export async function decryptLegacyCliBlob(
     throw new Error('Data too short — not a valid legacy encrypted file.');
   }
 
-  const salt = toBuffer(data.subarray(0, LEGACY_SALT_SIZE));
-  const nonce = toBuffer(
+  const salt = asBufferSource(data.subarray(0, LEGACY_SALT_SIZE));
+  const nonce = asBufferSource(
     data.subarray(LEGACY_SALT_SIZE, LEGACY_SALT_SIZE + LEGACY_NONCE_SIZE)
   );
   const tag = data.subarray(

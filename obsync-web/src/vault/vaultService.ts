@@ -1,15 +1,18 @@
 import { bytesToUtf8, utf8ToBytes } from '../crypto/base64';
 import { decryptLegacyCliBlob } from '../crypto/legacyDecrypt';
 import {
+  changePasswordWithCurrent,
   createVault,
   decryptBytes,
   decryptJson,
   encryptBytes,
   encryptJson,
-  regenerateRecoveryKey,
-  rewrapPassword,
+  isLegacyV1Blob,
+  recoverAndRewrapPassword,
+  regenerateRecoveryKeyWithPassword,
   unlockWithPassword,
-  unlockWithRecoveryKey,
+  upgradeVaultMetaToV2,
+  validateVaultMeta,
   type PrivateNoteEntry,
   type VaultIndex,
   type VaultMeta,
@@ -20,7 +23,24 @@ import type { MirrorSummary } from '../storage/types';
 export const VAULT_DIR = '.obsync-vault';
 export const VAULT_META_PATH = `${VAULT_DIR}/vault.json`;
 export const VAULT_INDEX_PATH = `${VAULT_DIR}/index.enc`;
-export const VAULT_NOTE_PATH = (id: string) => `${VAULT_DIR}/notes/${id}.enc`;
+export const VAULT_INDEX_AAD = 'index';
+const SAFE_NOTE_ID = /^[a-zA-Z0-9_-]{1,128}$/;
+
+export function assertValidNoteId(noteId: string): void {
+  if (!SAFE_NOTE_ID.test(noteId)) {
+    throw new Error('Invalid private note identifier.');
+  }
+}
+
+export const VAULT_NOTE_PATH = (id: string) => {
+  assertValidNoteId(id);
+  return `${VAULT_DIR}/notes/${id}.enc`;
+};
+
+export const vaultNoteAad = (id: string) => {
+  assertValidNoteId(id);
+  return `note:${id}`;
+};
 
 export interface VaultCheckResult {
   exists: boolean;
@@ -105,7 +125,14 @@ export class VaultService {
       };
     }
 
-    const meta = JSON.parse(bytesToUtf8(res.data)) as VaultMeta;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToUtf8(res.data));
+    } catch {
+      throw new Error('vault.json is corrupted (invalid JSON).');
+    }
+
+    const meta = validateVaultMeta(parsed);
     return {
       exists: true,
       meta,
@@ -126,7 +153,7 @@ export class VaultService {
     const index = createEmptyIndex();
 
     const metaBytes = utf8ToBytes(JSON.stringify(meta, null, 2));
-    const indexBytes = await encryptJson(dek, index);
+    const indexBytes = await encryptJson(dek, index, VAULT_INDEX_AAD);
 
     await this.storage.write(VAULT_META_PATH, metaBytes, 'Initialize Obsync private vault');
     const mirror = await this.storage.write(
@@ -145,7 +172,7 @@ export class VaultService {
     const dek = await unlockWithPassword(password, meta);
     const indexRes = await this.storage.read(VAULT_INDEX_PATH);
     const index = indexRes.data
-      ? await decryptJson<VaultIndex>(dek, indexRes.data)
+      ? await decryptJson<VaultIndex>(dek, indexRes.data, VAULT_INDEX_AAD)
       : createEmptyIndex();
 
     return {
@@ -161,8 +188,11 @@ export class VaultService {
     newPassword: string,
     meta: VaultMeta
   ): Promise<{ dek: CryptoKey; meta: VaultMeta; index: VaultIndex }> {
-    const dek = await unlockWithRecoveryKey(recoveryKey, meta);
-    const updatedMeta = await rewrapPassword(dek, newPassword, meta);
+    const { dek, meta: updatedMeta } = await recoverAndRewrapPassword(
+      recoveryKey,
+      newPassword,
+      meta
+    );
 
     await this.storage.write(
       VAULT_META_PATH,
@@ -172,18 +202,22 @@ export class VaultService {
 
     const indexRes = await this.storage.read(VAULT_INDEX_PATH);
     const index = indexRes.data
-      ? await decryptJson<VaultIndex>(dek, indexRes.data)
+      ? await decryptJson<VaultIndex>(dek, indexRes.data, VAULT_INDEX_AAD)
       : createEmptyIndex();
 
     return { dek, meta: updatedMeta, index };
   }
 
   async changeMasterPassword(
-    dek: CryptoKey,
+    currentPassword: string,
     newPassword: string,
     meta: VaultMeta
   ): Promise<VaultMeta> {
-    const updated = await rewrapPassword(dek, newPassword, meta);
+    const updated = await changePasswordWithCurrent(
+      currentPassword,
+      newPassword,
+      meta
+    );
     await this.storage.write(
       VAULT_META_PATH,
       utf8ToBytes(JSON.stringify(updated, null, 2)),
@@ -193,10 +227,11 @@ export class VaultService {
   }
 
   async regenerateRecoveryKeyAndSave(
-    dek: CryptoKey,
+    currentPassword: string,
     meta: VaultMeta
   ): Promise<{ meta: VaultMeta; recoveryKey: string }> {
-    const { meta: updated, recoveryKey } = await regenerateRecoveryKey(dek, meta);
+    const { meta: updated, recoveryKey } =
+      await regenerateRecoveryKeyWithPassword(currentPassword, meta);
     await this.storage.write(
       VAULT_META_PATH,
       utf8ToBytes(JSON.stringify(updated, null, 2)),
@@ -205,18 +240,91 @@ export class VaultService {
     return { meta: updated, recoveryKey };
   }
 
+  /**
+   * One-click Vault v1 -> v2 migration:
+   * 1. Verifies current master password and upgrades vault.json (AAD wraps + HKDF recovery key)
+   * 2. Re-encrypts any remaining v1 note blobs with per-note AES-GCM AAD (`note:<id>`)
+   * 3. Re-encrypts index.enc with AAD (`index`) and persists upgraded vault.json
+   */
+  async upgradeVaultToV2(
+    currentPassword: string,
+    dek: CryptoKey,
+    currentIndex: VaultIndex,
+    meta: VaultMeta,
+    onProgress?: (done: number, total: number) => void
+  ): Promise<{
+    meta: VaultMeta;
+    index: VaultIndex;
+    recoveryKey: string;
+    reencryptedNotes: number;
+  }> {
+    // Verify password first before modifying any remote files
+    const { meta: upgradedMeta, recoveryKey } = await upgradeVaultMetaToV2(
+      currentPassword,
+      meta
+    );
+
+    const mergedIndex = await this.fetchAndMergeIndex(dek, currentIndex);
+    const activeNotes = mergedIndex.notes.filter((n) => !n.deleted);
+    let reencryptedNotes = 0;
+
+    for (let i = 0; i < activeNotes.length; i++) {
+      const note = activeNotes[i];
+      onProgress?.(i, activeNotes.length);
+      assertValidNoteId(note.id);
+      const notePath = VAULT_NOTE_PATH(note.id);
+      const readRes = await this.storage.read(notePath);
+      if (!readRes.data) continue;
+
+      if (isLegacyV1Blob(readRes.data)) {
+        const plain = await decryptBytes(dek, readRes.data, vaultNoteAad(note.id));
+        const v2Cipher = await encryptBytes(dek, plain, vaultNoteAad(note.id));
+        plain.fill(0);
+        await this.storage.write(
+          notePath,
+          v2Cipher,
+          `Upgrade encrypted note ${note.id} to v2`
+        );
+        reencryptedNotes++;
+      }
+    }
+
+    const indexCipher = await encryptJson(dek, mergedIndex, VAULT_INDEX_AAD);
+    await this.storage.write(
+      VAULT_INDEX_PATH,
+      indexCipher,
+      'Upgrade encrypted vault index to v2'
+    );
+
+    await this.storage.write(
+      VAULT_META_PATH,
+      utf8ToBytes(JSON.stringify(upgradedMeta, null, 2)),
+      'Upgrade Obsync vault metadata to v2'
+    );
+
+    onProgress?.(activeNotes.length, activeNotes.length);
+
+    return {
+      meta: upgradedMeta,
+      index: mergedIndex,
+      recoveryKey,
+      reencryptedNotes,
+    };
+  }
+
   async refreshIndex(dek: CryptoKey): Promise<VaultIndex> {
     const res = await this.storage.read(VAULT_INDEX_PATH);
     if (!res.data) return createEmptyIndex();
-    return decryptJson<VaultIndex>(dek, res.data);
+    return decryptJson<VaultIndex>(dek, res.data, VAULT_INDEX_AAD);
   }
 
   async readPrivateNote(dek: CryptoKey, noteId: string): Promise<string> {
+    assertValidNoteId(noteId);
     const res = await this.storage.read(VAULT_NOTE_PATH(noteId));
     if (!res.data) {
       throw new Error('Encrypted note payload not found.');
     }
-    const plain = await decryptBytes(dek, res.data);
+    const plain = await decryptBytes(dek, res.data, vaultNoteAad(noteId));
     return bytesToUtf8(plain);
   }
 
@@ -227,7 +335,11 @@ export class VaultService {
     try {
       const res = await this.storage.read(VAULT_INDEX_PATH);
       if (!res.data) return currentIndex;
-      const remoteIndex = await decryptJson<VaultIndex>(dek, res.data);
+      const remoteIndex = await decryptJson<VaultIndex>(
+        dek,
+        res.data,
+        VAULT_INDEX_AAD
+      );
       return mergeVaultIndexes(currentIndex, remoteIndex);
     } catch {
       return currentIndex;
@@ -248,6 +360,7 @@ export class VaultService {
 
     const baseIndex = await this.fetchAndMergeIndex(dek, currentIndex);
     const id = input.id ?? createUuid();
+    assertValidNoteId(id);
     const existing = baseIndex.notes.find((n) => n.id === id);
 
     const note: PrivateNoteEntry = {
@@ -259,7 +372,11 @@ export class VaultService {
       deleted: false,
     };
 
-    const noteCipher = await encryptBytes(dek, utf8ToBytes(input.content));
+    const noteCipher = await encryptBytes(
+      dek,
+      utf8ToBytes(input.content),
+      vaultNoteAad(id)
+    );
     await this.storage.write(
       VAULT_NOTE_PATH(id),
       noteCipher,
@@ -276,11 +393,58 @@ export class VaultService {
       notes: nextNotes,
     };
 
-    const indexCipher = await encryptJson(dek, nextIndex);
+    const indexCipher = await encryptJson(dek, nextIndex, VAULT_INDEX_AAD);
     const mirror = await this.storage.write(
       VAULT_INDEX_PATH,
       indexCipher,
       'Update encrypted vault index'
+    );
+
+    return { index: nextIndex, note, mirror };
+  }
+
+  /**
+   * Renames or moves a private note in index.enc without re-encrypting or
+   * re-uploading its note content blob.
+   */
+  async renamePrivateNote(
+    dek: CryptoKey,
+    currentIndex: VaultIndex,
+    input: { id: string; title: string; folder: string }
+  ): Promise<{ index: VaultIndex; note: PrivateNoteEntry; mirror: MirrorSummary }> {
+    assertValidNoteId(input.id);
+    const cleanTitle = input.title.trim() || 'Untitled';
+    const cleanFolder = input.folder
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '');
+    const now = new Date().toISOString();
+
+    const baseIndex = await this.fetchAndMergeIndex(dek, currentIndex);
+    const existing = baseIndex.notes.find((n) => n.id === input.id);
+    if (!existing || existing.deleted) {
+      throw new Error('Private note not found.');
+    }
+
+    const note: PrivateNoteEntry = {
+      ...existing,
+      title: cleanTitle,
+      folder: cleanFolder,
+      updatedAt: now,
+      deleted: false,
+    };
+
+    const nextIndex: VaultIndex = {
+      version: 1,
+      updatedAt: now,
+      notes: baseIndex.notes.map((n) => (n.id === input.id ? note : n)),
+    };
+
+    const indexCipher = await encryptJson(dek, nextIndex, VAULT_INDEX_AAD);
+    const mirror = await this.storage.write(
+      VAULT_INDEX_PATH,
+      indexCipher,
+      'Rename encrypted note in vault index'
     );
 
     return { index: nextIndex, note, mirror };
@@ -291,6 +455,7 @@ export class VaultService {
     currentIndex: VaultIndex,
     noteId: string
   ): Promise<{ index: VaultIndex; mirror: MirrorSummary }> {
+    assertValidNoteId(noteId);
     const now = new Date().toISOString();
     const baseIndex = await this.fetchAndMergeIndex(dek, currentIndex);
     const existing = baseIndex.notes.find((n) => n.id === noteId);
@@ -319,7 +484,7 @@ export class VaultService {
       `Delete encrypted note ${noteId}`
     );
 
-    const indexCipher = await encryptJson(dek, nextIndex);
+    const indexCipher = await encryptJson(dek, nextIndex, VAULT_INDEX_AAD);
     const mirror = await this.storage.write(
       VAULT_INDEX_PATH,
       indexCipher,
@@ -335,12 +500,12 @@ export class VaultService {
     legacyPassword: string,
     legacyFolder = 'private'
   ): Promise<{ imported: number; failed: string[]; index: VaultIndex }> {
-    const prefix = `${legacyFolder.replace(/^\/+|\/+$/g, '')}/.encrypted/`;
+    const cleanFolder = legacyFolder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const prefix = `${cleanFolder}/.encrypted/`;
     const listRes = await this.storage.list(prefix);
     const encFiles = listRes.entries.filter((e) => e.path.endsWith('.enc'));
 
-    let workingIndex = currentIndex;
-    let imported = 0;
+    const importedEntries: PrivateNoteEntry[] = [];
     const failed: string[] = [];
 
     for (const file of encFiles) {
@@ -352,21 +517,59 @@ export class VaultService {
 
         const rawName = file.path.slice(prefix.length).replace(/\.enc$/i, '');
         const parts = rawName.split('/');
-        const title = (parts.pop() ?? 'Imported').replace(/\.md$/i, '');
+        const title = (parts.pop() ?? 'Imported').replace(/\.md$/i, '').trim() || 'Imported';
         const folder = parts.length > 0 ? `Imported/${parts.join('/')}` : 'Imported';
 
-        const saved = await this.savePrivateNote(dek, workingIndex, {
+        const id = createUuid();
+        const now = new Date().toISOString();
+        const noteCipher = await encryptBytes(
+          dek,
+          utf8ToBytes(content),
+          vaultNoteAad(id)
+        );
+        await this.storage.write(
+          VAULT_NOTE_PATH(id),
+          noteCipher,
+          `Import legacy encrypted note ${id}`
+        );
+
+        importedEntries.push({
+          id,
           title,
           folder,
-          content,
+          createdAt: now,
+          updatedAt: now,
+          deleted: false,
         });
-        workingIndex = saved.index;
-        imported++;
       } catch {
         failed.push(file.path);
       }
     }
 
-    return { imported, failed, index: workingIndex };
+    if (importedEntries.length === 0) {
+      return { imported: 0, failed, index: currentIndex };
+    }
+
+    // Batch-update index.enc ONCE instead of rewriting it on every note
+    const baseIndex = await this.fetchAndMergeIndex(dek, currentIndex);
+    const now = new Date().toISOString();
+    const nextIndex: VaultIndex = {
+      version: 1,
+      updatedAt: now,
+      notes: [...baseIndex.notes, ...importedEntries],
+    };
+
+    const indexCipher = await encryptJson(dek, nextIndex, VAULT_INDEX_AAD);
+    await this.storage.write(
+      VAULT_INDEX_PATH,
+      indexCipher,
+      `Import ${importedEntries.length} legacy encrypted note(s) into vault index`
+    );
+
+    return {
+      imported: importedEntries.length,
+      failed,
+      index: nextIndex,
+    };
   }
 }
