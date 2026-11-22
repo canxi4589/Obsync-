@@ -12,13 +12,13 @@
 ## Security & Encryption Model
 
 - **Key Wrapping (DEK / KEK):**
-  - On vault creation, Obsync generates a random 256-bit **Data Encryption Key (DEK)**.
-  - Your **Master Password** derives a Key-Encryption Key (KEK) via **PBKDF2-HMAC-SHA256 (600,000 iterations, random 16-byte salt)** to wrap the DEK inside `.obsync-vault/vault.json`.
-  - A one-time **Recovery Key** (`OBSYNC-XXXX-...`, 160-bit entropy) wraps a second copy of the DEK inside `vault.json`.
+  - On vault creation, Obsync generates a random 256-bit **Data Encryption Key (DEK)** and imports the unlocked session DEK as **non-extractable**.
+  - Your **Master Password** (minimum 12 characters) derives a Key-Encryption Key (KEK) via **PBKDF2-HMAC-SHA256 (600,000 iterations, random 16-byte salt)** to wrap the DEK inside `.obsync-vault/vault.json` (with AES-GCM AAD binding KDF parameters and wrap role).
+  - A one-time **Recovery Key** (`OBSYNC-XXXX-...`, 160-bit entropy) derives a KEK via **HKDF-SHA256** (with backward-compatible reading of legacy v1 vaults) to wrap a second copy of the DEK inside `vault.json`.
 - **Hidden Filenames & Zero Plaintext on Disk:**
-  - Encrypted note titles, folder paths, and timestamps live in `.obsync-vault/index.enc`.
-  - Encrypted note contents live in `.obsync-vault/notes/<uuid>.enc` (`[version 1B][nonce 12B][AES-GCM ciphertext + 16B tag]`).
-  - Your password is **never saved** anywhere (not on disk, not in `localStorage`, not on GitHub/Drive). Unlocking keeps the DEK only in memory until you click **Lock** or the idle timeout expires.
+  - Encrypted note titles, folder paths, and timestamps live in `.obsync-vault/index.enc` (AES-GCM AAD bound to `index`).
+  - Encrypted note contents live in `.obsync-vault/notes/<uuid>.enc` (`[version 1B][nonce 12B][AES-GCM ciphertext + 16B tag]`, AAD bound to `note:<uuid>` to prevent ciphertext swapping).
+  - Your password is **never saved** anywhere (not on disk, not in `localStorage`, not on GitHub/Drive). Unlocking keeps the non-extractable DEK only in memory until you click **Lock** or the wall-clock idle timeout expires. Changing your password or regenerating the Recovery Key requires confirming your current master password.
 - **Forgot Password?**
   - Click **Forgot password? Use Recovery Key** on the lock screen, enter your saved Recovery Key, and set a new master password without losing any notes.
 - **Legacy CLI Migration:**
@@ -50,6 +50,8 @@ npm run build
 2. In your GitHub repo settings, go to **Settings → Pages → Source** and select **GitHub Actions**.
 3. The included workflow [`.github/workflows/deploy-pwa.yml`](.github/workflows/deploy-pwa.yml) automatically builds `obsync-web/` and deploys `obsync-web/dist`.
 4. Open the GitHub Pages URL on your **iPhone in Safari → Share → Add to Home Screen** (or in Chrome/Edge on Windows → **Install Obsync**).
+
+> **Credential & Origin Protection:** GitHub PATs and S3/R2 keys are **never stored in plaintext**—they are encrypted at rest inside an AES-256-GCM envelope behind a Passphrase/PIN (PBKDF2-SHA256, 600,000 iterations) or WebAuthn Passkey (PRF + HKDF-SHA256), with decrypted tokens held strictly in RAM. For public/shared computers, switch **Device Credential Protection** to **Session-Only / Untrusted Device** (in-memory only: zero `localStorage`, `sessionStorage`, or `IndexedDB` writes). Because all repositories under `https://<username>.github.io` share one browser origin, deploying Obsync on a dedicated custom domain is still recommended if you host other sites under that account.
 
 ---
 
